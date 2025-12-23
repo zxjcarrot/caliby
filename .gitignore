@@ -1,0 +1,73 @@
+# Build directories
+build/
+cmake-build-*/
+_build/
+
+examples/perf*
+examples/catalog*
+examples/heapfile
+benchmark/perf*
+benchmark/sift*
+benchmark/catalog*
+benchmark/heapfile
+perf*
+# Python build artifacts
+*.egg-info/
+*.egg
+dist/
+*.so
+*.dylib
+*.dll
+__pycache__/
+tests/__pycache__
+examples/__pycache__
+*.py[cod]
+*$py.class
+.eggs/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.cproject
+.settings/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor backup files
+*.bak
+*.orig
+
+# Temporary files
+*.tmp
+*.temp
+
+# Data files (too large for git)
+data/
+*.fvecs
+*.ivecs
+*.bin
+*.idx

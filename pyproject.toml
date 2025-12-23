@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "cmake>=3.16", "pybind11>=2.6"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caliby"
+version = "0.1.0.dev20251222.180901"
+description = "High-Performance Disk-Aware Vector Search Library"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Caliby Contributors"}
+]
+keywords = [
+    "vector-search",
+    "approximate-nearest-neighbors", 
+    "hnsw",
+    "diskann",
+    "similarity-search",
+    "embeddings",
+    "machine-learning"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database :: Database Engines/Servers"
+]
+dependencies = [
+    "numpy>=1.19.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-benchmark",
+    "numpy>=1.19.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/caliby/caliby"
+Documentation = "https://github.com/caliby/caliby#readme"
+Repository = "https://github.com/caliby/caliby"
+Issues = "https://github.com/caliby/caliby/issues"
+
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
