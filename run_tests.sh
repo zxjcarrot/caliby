@@ -17,8 +17,8 @@ if [ ! -d "build" ]; then
 fi
 
 # Check if the Python module exists
-if [ ! -f build/caliby_py*.so ]; then
-    echo "Error: caliby_py module not found. Please build the project first:"
+if ! ls build/caliby*.so 1> /dev/null 2>&1; then
+    echo "Error: caliby module not found. Please build the project first:"
     echo "  cd build && make -j\$(nproc)"
     exit 1
 fi

@@ -470,8 +470,8 @@ def main():
     parser.add_argument('--M', type=int, default=16, help='HNSW M parameter (connectivity)')
     parser.add_argument('--ef-construction', type=int, default=100, help='ef_construction parameter')
     parser.add_argument('--ef-search', type=int, default=50, help='ef_search parameter')
-    parser.add_argument('--skip', nargs='+', choices=['caliby', 'usearch', 'faiss'], 
-                        help='Libraries to skip')
+    parser.add_argument('--skip', type=str,
+                        help='Libraries to skip (comma or space separated, e.g., "usearch,faiss" or "usearch faiss")')
     args = parser.parse_args()
     
     print("="*100)
@@ -480,8 +480,16 @@ def main():
     print(f"\nDataset: SIFT1M (1M vectors, 128 dimensions)")
     print(f"Parameters: M={args.M}, ef_construction={args.ef_construction}, ef_search={args.ef_search}")
     
-    # Check available libraries
-    skip_libs = set(args.skip) if args.skip else set()
+    # Check available libraries - parse skip argument to support both comma and space separated
+    skip_libs = set()
+    if args.skip:
+        # Split by comma first, then by space
+        for part in args.skip.replace(',', ' ').split():
+            lib = part.strip().lower()
+            if lib in ['caliby', 'usearch', 'faiss']:
+                skip_libs.add(lib)
+            elif lib:  # non-empty but invalid
+                print(f"Warning: Unknown library '{lib}' in --skip, ignoring. Valid options: caliby, usearch, faiss")
     enabled_libs = {lib: available and lib not in skip_libs 
                     for lib, available in LIBS_AVAILABLE.items()}
     

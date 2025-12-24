@@ -599,7 +599,7 @@ struct BufferManager {
 
     static constexpr u64 invalidFrame = std::numeric_limits<u64>::max();
     static constexpr PID invalidPID = std::numeric_limits<PID>::max();
-    static constexpr u32 freePartitionCount = 64;
+    static constexpr u32 freePartitionCount = 1;
 
     char cachline_pad0[64];
     ResidentPageSet residentSet;
@@ -797,12 +797,13 @@ struct GuardO {
     T* ptr;
     u64 version;
     static const u64 moved = ~0ull;
+    IndexTranslationArray* arr = nullptr;
 
     // constructor
-    explicit GuardO(u64 pid) : pid(pid), ptr(nullptr) { init(); }
+    explicit GuardO(u64 pid) : pid(pid), ptr(nullptr), arr(nullptr) { init(); }
 
     // Specialized constructor with IndexTranslationArray to bypass TLS cache
-    explicit GuardO(u64 pid, IndexTranslationArray* arr) : pid(pid), ptr(nullptr) { initWithArray(arr); }
+    explicit GuardO(u64 pid, IndexTranslationArray* arr) : pid(pid), ptr(nullptr), arr(arr) { initWithArray(arr); }
 
     template <class T2>
     GuardO(u64 pid, GuardO<T2>& parent) {
@@ -816,6 +817,10 @@ struct GuardO {
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
+        arr = other.arr;
+        other.pid = moved;
+        other.ptr = nullptr;
+        other.arr = nullptr;
     }
 
     void init() {
@@ -860,10 +865,10 @@ struct GuardO {
     void initWithArray(IndexTranslationArray* arr) {
         assert(pid != moved);
         // Fallback to regular init if arr is null (for non-Array2Level modes)
-        if (arr == nullptr) {
-            init();
-            return;
-        }
+        // if (arr == nullptr) {
+        //     init();
+        //     return;
+        // }
         // Extract local page ID from the global PID
         u32 localPageId = static_cast<u32>(pid & TwoLevelPageStateArray::LOCAL_PAGE_MASK);
         PageState& ps = arr->get(localPageId);
@@ -909,8 +914,10 @@ struct GuardO {
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
+        arr = other.arr;
         other.pid = moved;
         other.ptr = nullptr;
+        other.arr = nullptr;
         return *this;
     }
 
@@ -922,7 +929,10 @@ struct GuardO {
 
     void checkVersionAndRestart() {
         if (pid != moved) {
-            PageState& ps = bm.getPageState(pid);
+            // PageState& ps = bm.getPageState(pid);
+            u32 localPageId = static_cast<u32>(pid & TwoLevelPageStateArray::LOCAL_PAGE_MASK);
+            PageState& ps = arr ? arr->get(localPageId) : bm.getPageState(pid);
+
             u64 stateAndVersion = ps.stateAndVersion.load();
             if (version == stateAndVersion)  // fast path, nothing changed
                 return;
@@ -961,12 +971,12 @@ struct GuardORelaxed {
     T* ptr;
     u64 version;
     static const u64 moved = ~0ull;
-
+    IndexTranslationArray* arr;
     // constructor
-    explicit GuardORelaxed(u64 pid) : pid(pid), ptr(nullptr) { init(); }
+    explicit GuardORelaxed(u64 pid) : pid(pid), ptr(nullptr), arr(nullptr) { init(); }
 
     // Specialized constructor with IndexTranslationArray to bypass TLS cache
-    explicit GuardORelaxed(u64 pid, IndexTranslationArray* arr) : pid(pid), ptr(nullptr) { initWithArray(arr); }
+    explicit GuardORelaxed(u64 pid, IndexTranslationArray* arr) : pid(pid), ptr(nullptr), arr(arr) { initWithArray(arr); }
 
     template <class T2>
     GuardORelaxed(u64 pid, GuardO<T2>& parent) {
@@ -996,6 +1006,10 @@ struct GuardORelaxed {
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
+        arr = other.arr;
+        other.pid = moved;
+        other.ptr = nullptr;
+        other.arr = nullptr;
     }
 
 
@@ -1091,8 +1105,10 @@ struct GuardORelaxed {
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
+        arr = other.arr;
         other.pid = moved;
         other.ptr = nullptr;
+        other.arr = nullptr;
         return *this;
     }
 
@@ -1104,7 +1120,9 @@ struct GuardORelaxed {
 
     void checkVersionAndRestart() {
         if (pid != moved) {
-            PageState& ps = bm.getPageState(pid);
+            u32 localPageId = static_cast<u32>(pid & TwoLevelPageStateArray::LOCAL_PAGE_MASK);
+            PageState& ps = arr ? arr->get(localPageId) : bm.getPageState(pid);
+
             u64 stateAndVersion = ps.stateAndVersion.load();
             if (version == stateAndVersion)  // fast path, nothing changed
                 return;

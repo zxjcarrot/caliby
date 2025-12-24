@@ -525,7 +525,7 @@ void* allocHuge(size_t size) {
 
 // use when lock is not free
 void yield(u64 counter) { 
-    //_mm_pause(); 
+
 }
 
 ResidentPageSet::ResidentPageSet(u64 maxCount) : count(next_pow2(maxCount * 1.5)), mask(count - 1), clockPos(0) {

@@ -32,11 +32,10 @@ def temp_dir_session():
 
 @pytest.fixture(scope="session")
 def caliby_module_session(temp_dir_session):
-    """Import caliby module once per session (avoids double registration)."""
+    """Import caliby module once per session."""
     import caliby
     # Configure buffer pool via module-level API
-    # Note: VIRTGB is auto-computed per-index, only PHYSGB needs to be set
-    caliby.set_buffer_config(size_gb=0.3)
+    caliby.set_buffer_config(size_gb=1)
     return caliby
 
 
@@ -49,5 +48,6 @@ def temp_dir(temp_dir_session):
 
 @pytest.fixture(scope="module") 
 def caliby_module(caliby_module_session):
+
     """Module-scoped alias for caliby_module_session."""
     return caliby_module_session

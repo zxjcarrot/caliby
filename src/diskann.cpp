@@ -260,7 +260,7 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<
     for (size_t i = 0; i < ids.size(); ++i) {
         items.push_back({getNodePID(ids[i]), ids[i], i});
     }
-    // std::sort(items.begin(), items.end(), [](const IdWithIdx& a, const IdWithIdx& b) { return a.pid < b.pid; });
+    std::sort(items.begin(), items.end(), [](const IdWithIdx& a, const IdWithIdx& b) { return a.pid < b.pid; });
 
     // // Prefetch unique PIDs
     thread_local std::vector<PID> pids;
@@ -269,7 +269,7 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<
     for (size_t i = 0; i < items.size();) {
         PID p = items[i].pid;
         pids.push_back(p);
-        // while (i < items.size() && items[i].pid == p) ++i;
+        while (i < items.size() && items[i].pid == p) ++i;
     }
     if (!pids.empty()) bm.prefetchPages(pids.data(), pids.size());
 
