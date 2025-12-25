@@ -15,8 +15,8 @@ echo "========================================"
 echo ""
 
 # Step 0: Update version number with timestamp
-echo "[0/7] Updating version number..."
-TIMESTAMP=$(date +%Y%m%d.%H%M%S)
+echo "[0/4] Updating version number..."
+TIMESTAMP=$(date +%Y%m%d%H%M%S)
 NEW_VERSION="0.1.0.dev${TIMESTAMP}"
 sed -i "s/^version = .*/version = \"${NEW_VERSION}\"/" pyproject.toml
 echo "✓ Version updated to: $NEW_VERSION"
@@ -38,43 +38,14 @@ fi
 echo "✓ Cleanup complete"
 echo ""
 
-# Step 2: Create fresh build directory
-echo "[2/7] Creating build directory..."
-mkdir -p build
-cd build
-echo "✓ Build directory created"
+# Step 2: Install using pip (uses setup.py configuration)
+echo "[2/4] Installing caliby with pip (uses setup.py config)..."
+pip install -e . --force-reinstall --no-build-isolation
+echo "✓ Build and install complete"
 echo ""
 
-# Step 3: Run CMake configuration
-echo "[3/7] Running CMake configuration..."
-cmake .. \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DBUILD_SHARED_LIBS=ON \
-    -DCMAKE_CXX_FLAGS="-g -fno-omit-frame-pointer -DCALICO_SPECIALIZATION_CALICO"
-echo "✓ CMake configuration complete"
-echo ""
-
-# Step 4: Build with all CPU cores
-echo "[4/7] Building caliby..."
-make -j$(nproc)
-echo "✓ Build complete"
-echo ""
-
-# Step 5: Copy module to root directory
-echo "[5/7] Installing module..."
-MODULE_FILE=$(ls caliby.cpython-*.so 2>/dev/null | head -1)
-if [ -n "$MODULE_FILE" ]; then
-    cp "$MODULE_FILE" ..
-    echo "✓ Module copied to root: $MODULE_FILE"
-else
-    echo "✗ Error: Module file not found!"
-    exit 1
-fi
-cd ..
-echo ""
-
-# Step 6: Update version in Python module
-echo "[6/7] Updating Python module version..."
+# Step 3: Update version in Python module
+echo "[3/4] Updating Python module version..."
 VERSION_LINE="m.attr(\"__version__\") = \"${NEW_VERSION}\";"
 if grep -q "__version__" src/bindings.cpp; then
     sed -i "s|m\.attr(\"__version__\").*|${VERSION_LINE}|" src/bindings.cpp
@@ -83,23 +54,13 @@ else
     sed -i "/m\.doc()/a\\    ${VERSION_LINE}" src/bindings.cpp
 fi
 # Rebuild to include version update
-cd build
 echo "  Rebuilding with version..."
-make -j$(nproc)
-MODULE_FILE=$(ls caliby.cpython-*.so 2>/dev/null | head -1)
-if [ -n "$MODULE_FILE" ]; then
-    cp "$MODULE_FILE" ..
-    echo "  ✓ Module with version copied: $MODULE_FILE"
-else
-    echo "  ✗ Error: Module file not found after version rebuild!"
-    exit 1
-fi
-cd ..
+pip install -e . --force-reinstall --no-build-isolation
 echo "✓ Version embedded in module"
 echo ""
 
-# Step 7: Verify installation
-echo "[7/7] Verifying installation..."
+# Step 4: Verify installation
+echo "[4/4] Verifying installation..."
 if python3 -c "import caliby; print('  Version:', caliby.__version__ if hasattr(caliby, '__version__') else 'N/A')" 2>&1; then
     echo "✓ Caliby module loaded successfully"
 else

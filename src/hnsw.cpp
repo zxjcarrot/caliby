@@ -795,7 +795,9 @@ void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id
     } else {
         entry_point_with_dist_opt = std::nullopt;
     }
-
+    std::vector<float> neighbor_vector_copy(Dim);
+    std::vector<u32> current_neighbors_ids; // Using vector for potential modification.
+    std::unordered_map<u32, std::vector<float>> connection_vectors;
     // --- 4. Connection phase: from new_node_level down to 0 ---
     for (int level = std::min(static_cast<u32>(new_node_level), max_l); level >= 0; --level) {
         // Find the best neighbors for the new node at the current level.
@@ -837,11 +839,10 @@ void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id
             for (;;) {  // OLC retry loop for updating a single neighbor
                 try {
                     // --- PHASE 1: READ EVERYTHING NEEDED, WITHOUT ANY EXCLUSIVE LOCKS ---
-                    std::vector<float> neighbor_vector_copy(Dim);
-                    std::vector<u32> current_neighbors_ids; // Using vector for potential modification.
-                    std::unordered_map<u32, std::vector<float>> connection_vectors;
+                    current_neighbors_ids.clear();
+                    connection_vectors.clear();
                     bool needs_pruning;
-
+                    
                     {
                         GuardO<HNSWPage> neighbor_page_guard(neighbor_pid, index_array);
                         NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
@@ -856,12 +857,12 @@ void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id
                     needs_pruning = (current_neighbors_ids.size() >= M_level);
 
                     if (needs_pruning) {
-                        for (u32 conn_id : current_neighbors_ids) {
-                            GuardORelaxed<HNSWPage> conn_page_guard(getNodePID(conn_id), index_array);
-                            NodeAccessor conn_acc(conn_page_guard.ptr, getNodeIndexInPage(conn_id), this);
-                            const float* conn_vec_ptr = conn_acc.getVector();
-                            connection_vectors[conn_id].assign(conn_vec_ptr, conn_vec_ptr + Dim);
-                        }
+                        // for (u32 conn_id : current_neighbors_ids) {
+                        //     GuardORelaxed<HNSWPage> conn_page_guard(getNodePID(conn_id), index_array);
+                        //     NodeAccessor conn_acc(conn_page_guard.ptr, getNodeIndexInPage(conn_id), this);
+                        //     const float* conn_vec_ptr = conn_acc.getVector();
+                        //     connection_vectors[conn_id].assign(conn_vec_ptr, conn_vec_ptr + Dim);
+                        // }
                     }
 
                     // --- PHASE 2: ACQUIRE A SINGLE LOCK AND WRITE ---
@@ -875,14 +876,19 @@ void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id
                             std::priority_queue<std::pair<float, u32>> connections_to_prune;
                             
                             connections_to_prune.push({dist_point_to_neighbor, new_node_id});
-
+                            
                             for (u32 conn_id : latest_neighbors_span) {
-                                auto it = connection_vectors.find(conn_id);
-                                if (it != connection_vectors.end()) {
-                                    const std::vector<float>& conn_vector = it->second;
-                                    float dist = DistanceMetric::compare(neighbor_vector_copy.data(), conn_vector.data(), Dim);
-                                    connections_to_prune.push({dist, conn_id});
-                                }
+                                // auto it = connection_vectors.find(conn_id);
+                                // if (it != connection_vectors.end()) {
+                                //     const std::vector<float>& conn_vector = it->second;
+                                //     float dist = DistanceMetric::compare(neighbor_vector_copy.data(), conn_vector.data(), Dim);
+                                //     connections_to_prune.push({dist, conn_id});
+                                // }
+                                GuardORelaxed<HNSWPage> conn_page_guard(getNodePID(conn_id), index_array);
+                                NodeAccessor conn_acc(conn_page_guard.ptr, getNodeIndexInPage(conn_id), this);
+                                const float* conn_vec_ptr = conn_acc.getVector();
+                                float dist = DistanceMetric::compare(neighbor_vector_copy.data(), conn_vec_ptr, Dim);
+                                connections_to_prune.push({dist, conn_id});
                             }
 
                             while (connections_to_prune.size() > M_level) {

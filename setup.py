@@ -36,13 +36,14 @@ class CMakeBuild(build_ext):
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
-            f"-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+            f"-DCMAKE_BUILD_TYPE=Release",
             "-DBUILD_SHARED_LIBS=ON",
-            "-DCMAKE_CXX_FLAGS=-g -fno-omit-frame-pointer",
-            "-DCALICO_SPECIALIZATION_CALICO=1"
+            "-DCMAKE_STRIP=/bin/true",
+            "-DCALIBY_BUILD_PYTHON=ON",
+            "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -g -fno-omit-frame-pointer -march=native -DNDEBUG -DCALICO_SPECIALIZATION_CALICO",
         ]
 
-        build_args = ["--config", "RelWithDebInfo"]
+        build_args = ["--config", "Release"]
         
         # Use all available CPUs for compilation
         build_args += ["-j", str(multiprocessing.cpu_count())]

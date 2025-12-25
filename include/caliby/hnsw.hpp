@@ -234,8 +234,6 @@ class HNSW {
     static size_t estimateMaxLevel(u64 max_elements, size_t M);
 
     inline float calculateDistance(const float* v1, const float* v2) const {
-        // This is now the single point for distance calculation counting.
-        stats_.dist_comps.fetch_add(1, std::memory_order_relaxed);
         return DistanceMetric::compare(v1, v2, Dim);
     }
 
