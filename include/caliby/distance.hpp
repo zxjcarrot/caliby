@@ -66,33 +66,32 @@ L2Sqr_AVX512_16_Residuals(const float *pVect1, const float *pVect2, size_t qty) 
 // --- AVX Implementation (processes 16 elements using two 8-element chunks) ---
 static inline float
 L2Sqr_AVX_16(const float *pVect1, const float *pVect2, size_t qty) {
-    alignas(32) float TmpRes[8];
-    size_t qty16 = qty >> 4;  // qty / 16
+    size_t qty16 = qty >> 4;
     const float *pEnd1 = pVect1 + (qty16 << 4);
-
-    __m256 diff, v1, v2;
-    __m256 sum = _mm256_set1_ps(0);
+    __m256 sum = _mm256_setzero_ps();
+    __m256 sum2 = _mm256_setzero_ps();
 
     while (pVect1 < pEnd1) {
-        // First 8 elements
-        v1 = _mm256_loadu_ps(pVect1);
-        pVect1 += 8;
-        v2 = _mm256_loadu_ps(pVect2);
-        pVect2 += 8;
-        diff = _mm256_sub_ps(v1, v2);
-        sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
-
-        // Second 8 elements
-        v1 = _mm256_loadu_ps(pVect1);
-        pVect1 += 8;
-        v2 = _mm256_loadu_ps(pVect2);
-        pVect2 += 8;
-        diff = _mm256_sub_ps(v1, v2);
-        sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
+        __m256 v1_0 = _mm256_loadu_ps(pVect1);
+        __m256 v2_0 = _mm256_loadu_ps(pVect2);
+        __m256 v1_1 = _mm256_loadu_ps(pVect1 + 8);
+        __m256 v2_1 = _mm256_loadu_ps(pVect2 + 8);
+        __m256 d0 = _mm256_sub_ps(v1_0, v2_0);
+        __m256 d1 = _mm256_sub_ps(v1_1, v2_1);
+        sum = _mm256_fmadd_ps(d0, d0, sum);
+        sum2 = _mm256_fmadd_ps(d1, d1, sum2);
+        pVect1 += 16;
+        pVect2 += 16;
     }
-
-    _mm256_store_ps(TmpRes, sum);
-    return TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] + TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7];
+    sum = _mm256_add_ps(sum, sum2);
+    __m128 vlow = _mm256_castps256_ps128(sum);
+    __m128 vhigh = _mm256_extractf128_ps(sum, 1);
+    vlow = _mm_add_ps(vlow, vhigh);
+    __m128 shuf = _mm_movehdup_ps(vlow);
+    __m128 sums = _mm_add_ps(vlow, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    return _mm_cvtss_f32(sums);
 }
 
 static inline float
