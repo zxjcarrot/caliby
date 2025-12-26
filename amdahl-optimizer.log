@@ -1,0 +1,65 @@
+Traceback (most recent call last):
+  File "/home/zxjcarrot/.local/bin/amdahl-optimizer", line 3, in <module>
+    from amdahl_optimizer.cli import main
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/__init__.py", line 10, in <module>
+    from .core.optimizer import AmdahlOptimizer
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/core/optimizer.py", line 10, in <module>
+    from .optimization_planner import OptimizationPlanner
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/core/optimization_planner.py", line 23
+    self.model = \"gemini-3-flash-preview\"
+                  ^
+SyntaxError: unexpected character after line continuation character
+Traceback (most recent call last):
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/cli.py", line 59, in main
+    optimizer.run()
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/core/optimizer.py", line 44, in run
+    self.ctx = analyzer.analyze(self.project_description_file)
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/core/project_analyzer.py", line 48, in analyze
+    ctx.build_script = self._generate_build_code(ctx)
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/core/project_analyzer.py", line 170, in _generate_build_code
+    response = self.client.chat.completions.create(
+  File "/home/zxjcarrot/.local/lib/python3.10/site-packages/openai/_utils/_utils.py", line 286, in wrapper
+    return func(*args, **kwargs)
+  File "/home/zxjcarrot/.local/lib/python3.10/site-packages/openai/resources/chat/completions/completions.py", line 1192, in create
+    return self._post(
+  File "/home/zxjcarrot/.local/lib/python3.10/site-packages/openai/_base_client.py", line 1259, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+  File "/home/zxjcarrot/.local/lib/python3.10/site-packages/openai/_base_client.py", line 1047, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found for google/gemini-pro-1.5.', 'code': 404}, 'user_id': 'user_35Cnt0fvaku15yV9WAeuTYG7ULC'}
+======================================================================
+🚀 AmdahlOptimizer - Autonomous Performance Optimization
+======================================================================
+
+📋 Step 1: Analyzing project description...
+🤖 Generating executable code from natural language descriptions...
+  📦 Generating build script...
+
+❌ Error: Error code: 404 - {'error': {'message': 'No endpoints found for google/gemini-pro-1.5.', 'code': 404}, 'user_id': 'user_35Cnt0fvaku15yV9WAeuTYG7ULC'}
+Traceback (most recent call last):
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/cli.py", line 59, in main
+    optimizer.run()
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/core/optimizer.py", line 44, in run
+    self.ctx = analyzer.analyze(self.project_description_file)
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/core/project_analyzer.py", line 48, in analyze
+    ctx.build_script = self._generate_build_code(ctx)
+  File "/home/zxjcarrot/Workspace/AmdahlEvolve/amdahl_optimizer/core/project_analyzer.py", line 170, in _generate_build_code
+    response = self.client.chat.completions.create(
+  File "/home/zxjcarrot/.local/lib/python3.10/site-packages/openai/_utils/_utils.py", line 286, in wrapper
+    return func(*args, **kwargs)
+  File "/home/zxjcarrot/.local/lib/python3.10/site-packages/openai/resources/chat/completions/completions.py", line 1192, in create
+    return self._post(
+  File "/home/zxjcarrot/.local/lib/python3.10/site-packages/openai/_base_client.py", line 1259, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+  File "/home/zxjcarrot/.local/lib/python3.10/site-packages/openai/_base_client.py", line 1047, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.BadRequestError: Error code: 400 - {'error': {'message': 'gemini-3-flash-preview is not a valid model ID', 'code': 400}, 'user_id': 'user_35Cnt0fvaku15yV9WAeuTYG7ULC'}
+======================================================================
+🚀 AmdahlOptimizer - Autonomous Performance Optimization
+======================================================================
+
+📋 Step 1: Analyzing project description...
+🤖 Generating executable code from natural language descriptions...
+  📦 Generating build script...
+
+❌ Error: Error code: 400 - {'error': {'message': 'gemini-3-flash-preview is not a valid model ID', 'code': 400}, 'user_id': 'user_35Cnt0fvaku15yV9WAeuTYG7ULC'}

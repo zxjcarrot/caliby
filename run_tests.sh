@@ -9,17 +9,12 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Check if build exists
-if [ ! -d "build" ]; then
-    echo "Error: build directory not found. Please build the project first:"
-    echo "  mkdir build && cd build && cmake .. && make -j\$(nproc)"
-    exit 1
-fi
-
-# Check if the Python module exists
-if ! ls build/caliby*.so 1> /dev/null 2>&1; then
-    echo "Error: caliby module not found. Please build the project first:"
-    echo "  cd build && make -j\$(nproc)"
+# Check if caliby module is installed (via pip install -e .)
+if ! python3 -c "import caliby" 2>/dev/null; then
+    echo "Error: caliby module not installed. Please build the project first:"
+    echo "  ./rebuild.sh"
+    echo "  OR"
+    echo "  pip install -e ."
     exit 1
 fi
 
@@ -32,9 +27,6 @@ touch "$TEMP_DIR/heapfile"
 
 # Run tests from temp directory
 cd "$TEMP_DIR"
-
-# Add build directory to PYTHONPATH
-export PYTHONPATH="$SCRIPT_DIR/build:$PYTHONPATH"
 
 # Run pytest (capture exit code to handle cleanup properly)
 python3 -m pytest "$SCRIPT_DIR/tests" "$@"

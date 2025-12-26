@@ -326,13 +326,7 @@ class HNSW {
             const u16* counts_per_level = getLevelCounts();
             if (level >= hnsw_instance->MaxLevel) return {};
 
-            u32 level_neighbor_offset_count = 0;
-            if (level > 0) {
-                level_neighbor_offset_count += hnsw_instance->M0;
-                for (u32 i = 1; i < level; ++i) {
-                    level_neighbor_offset_count += hnsw_instance->M;
-                }
-            }
+            u32 level_neighbor_offset_count = (level == 0) ? 0 : (u32)(hnsw_instance->M0 + (level - 1) * hnsw_instance->M);
 
             const u8* node_start = page->getNodeData() + node_offset;
             const u32* neighbor_ids_start =
