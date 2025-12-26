@@ -310,10 +310,8 @@ std::pair<float, u32> HNSW<DistanceMetric>::findBestEntryPointForLevel(const flo
     vl_type* visited_array = visited_nodes->mass;
     vl_type visited_array_tag = visited_nodes->curV;
 
-    std::vector<PID> pages_to_prefetch;
-    std::vector<u32> offsets_within_pages;
-    pages_to_prefetch.reserve(24);
-    offsets_within_pages.reserve(24);
+    PID pages_to_prefetch_buf[128];
+    u32 offsets_within_pages_buf[128];
 
     bool changed = true;
     while (changed) {
