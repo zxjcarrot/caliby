@@ -81,3 +81,4 @@ catalog.dat
 out.perf-folded
 flamegraph.svg
 caliby_flamegraph.svg
+out.folded
