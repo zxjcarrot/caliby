@@ -71,3 +71,13 @@ data/
 *.ivecs
 *.bin
 *.idx
+
+# Amdahl Optimizer artifacts
+.amdahl/
+
+# Profiling and benchmark artifacts
+heapfile
+catalog.dat
+out.perf-folded
+flamegraph.svg
+caliby_flamegraph.svg
