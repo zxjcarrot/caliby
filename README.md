@@ -6,7 +6,7 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Linux](https://img.shields.io/badge/platform-linux-lightgrey.svg)](https://www.linux.org/)
 
-Caliby is a high-performance vector similarity search library that efficiently handles datasets larger than available memory. Built on an innovative buffer pool design, Caliby delivers **in-memory performance when data fits in RAM** and **graceful degradation when it doesn't** — without requiring expensive hardware or complex distributed systems.
+Caliby is a high-performance vector similarity search library that efficiently handles datasets larger than available memory. Built on an innovative buffer pool design, Caliby delivers **best-in-class in-memory performance when data fits in RAM** and **graceful degradation when it doesn't** — without requiring expensive hardware or complex distributed systems.
 
 ## ✨ Key Features
 
