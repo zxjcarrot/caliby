@@ -66,20 +66,6 @@ labels, distances = index.search_knn(query, k=10, ef_search=50)
 queries = np.random.rand(100, 128).astype(np.float32)
 results = index.search_knn_parallel(queries, k=10, ef_search=50, num_threads=4)
 ```
-
-## 📊 Performance
-
-Caliby delivers exceptional performance across different memory scenarios:
-
-| Scenario | Dataset | Caliby | Faiss | Speedup |
-|----------|---------|--------|-------|---------|
-| In-Memory | SIFT1M | 5,200 QPS | 5,100 QPS | 1.02x |
-| In-Memory | Deep10M | 3,800 QPS | 3,600 QPS | 1.06x |
-| 50% Memory | SIFT10M | 2,100 QPS | 890 QPS | 2.4x |
-| 25% Memory | SIFT10M | 1,200 QPS | 320 QPS | 3.8x |
-
-*Benchmarks run on AWS m7a.8xlarge (32 vCPUs, 128GB RAM), single-threaded search, recall@10 > 0.95*
-
 ## 🏗️ Index Types
 
 ### HNSW (Hierarchical Navigable Small World)
@@ -155,19 +141,6 @@ print(f"Dimension: {user_index.get_dim()}")
 user_index.add_points(user_vectors)
 product_index.add_points(product_vectors)
 ```
-
-### Memory Management
-
-```python
-# Configure the buffer pool for your workload
-caliby.configure(
-    memory_limit_gb=32,          # Total memory budget
-    huge_pages=True,             # Use 2MB huge pages (recommended)
-    prefetch_depth=8,            # I/O prefetch depth
-    eviction_batch_size=64,      # Pages to evict at once
-)
-```
-
 ### Persistence & Recovery
 
 ```python
