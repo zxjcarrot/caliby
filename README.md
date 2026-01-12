@@ -10,7 +10,7 @@ Caliby is a high-performance vector similarity search library that efficiently h
 
 ## ✨ Key Features
 
-- **🔥 In-Memory Speed**: Matches or exceeds Faiss performance when data fits in memory
+- **🔥 In-Memory Speed**: Matches or exceeds HNSWLib/Faiss/Usearch performance when data fits in memory
 - **💾 Larger-Than-Memory**: Seamlessly handles datasets that exceed RAM with minimal performance loss
 - **🎯 Multiple Index Types**: HNSW, DiskANN, and IVF indexes with unified API
 - **🐍 Python First**: Native Python bindings with NumPy integration
