@@ -226,13 +226,7 @@ cd build && ctest --output-on-failure
 pytest python/tests/
 ```
 
-## 📚 Documentation
-
-- [Getting Started Guide](docs/getting-started.md)
-- [API Reference](docs/api-reference.md)
-- [Performance Tuning](docs/performance-tuning.md)
-- [Architecture Overview](docs/architecture.md)
-- [Contributing Guide](CONTRIBUTING.md)
+## 📚 Documentation[WORK IN PROGRESS]
 
 ## 🤝 Contributing
 
@@ -247,11 +241,6 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Built on research from [Calico: High-Performance Buffer Management](link-to-paper)
-- Inspired by [Faiss](https://github.com/facebookresearch/faiss), [HNSWlib](https://github.com/nmslib/hnswlib), and [DiskANN](https://github.com/microsoft/DiskANN)
 
 ## 📬 Contact
 
