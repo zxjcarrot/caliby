@@ -40,6 +40,8 @@ class CMakeBuild(build_ext):
             "-DBUILD_SHARED_LIBS=ON",
             "-DCMAKE_STRIP=/bin/true",
             "-DCALIBY_BUILD_PYTHON=ON",
+            "-DCMAKE_CXX_FLAGS_DEBUG=-O1 -g -fno-omit-frame-pointer -march=native -DCALICO_SPECIALIZATION_CALICO",
+            "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g -fno-omit-frame-pointer -march=native -DNDEBUG -DCALICO_SPECIALIZATION_CALICO",
             "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -g -fno-omit-frame-pointer -march=native -DNDEBUG -DCALICO_SPECIALIZATION_CALICO",
         ]
 

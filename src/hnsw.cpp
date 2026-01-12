@@ -336,15 +336,17 @@ std::pair<float, u32> HNSW<DistanceMetric>::findBestEntryPointForLevel(const flo
                 // for (const u32& neighbor_id : neighbors_span) {
                 //     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
                 // }
-                pages_to_prefetch.clear();
-                offsets_within_pages.clear();
+                size_t prefetch_count = 0;
                 for (const u32& neighbor_id : neighbors_span) {
-                    if (!(visited_array[neighbor_id] == visited_array_tag)) {
-                        pages_to_prefetch.push_back(getNodePID(neighbor_id));
-                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
+                    if (!(visited_array[neighbor_id] == visited_array_tag) && prefetch_count < 128) {
+                        pages_to_prefetch_buf[prefetch_count] = getNodePID(neighbor_id);
+                        offsets_within_pages_buf[prefetch_count] = NodeAccessor::getVectorOffset(this, neighbor_id);
+                        prefetch_count++;
                     }
                 }
-                bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
+                if (prefetch_count > 0) {
+                    bm.prefetchPages(pages_to_prefetch_buf, prefetch_count, offsets_within_pages_buf);
+                }
             }
 
             for (int i = 0; i < (int)neighbors_span.size(); ++i) {

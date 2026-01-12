@@ -20,7 +20,7 @@ option(CALIBY_USE_OPENMP "Use OpenMP for parallelization" ON)
 # Compiler flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -fPIC")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -ffast-math -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -ffast-math -fno-omit-frame-pointer -g")
 
 # Find required packages
 find_package(Threads REQUIRED)
@@ -69,6 +69,7 @@ set(CALIBY_SOURCES
     src/diskann.cpp
     src/distance_diskann.cpp
     src/catalog.cpp
+    src/ivfpq.cpp
 )
 
 # Create static library

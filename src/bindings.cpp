@@ -13,6 +13,7 @@
 #include "diskann.hpp"
 #include "distance.hpp"
 #include "hnsw.hpp"
+#include "ivfpq.hpp"
 
 #if defined(_WIN32)
 #include <psapi.h>
@@ -100,7 +101,7 @@ using HnswIndexType = HNSW<hnsw_distance::SIMDAcceleratedL2>;
 // --- Python Module Definition ---
 PYBIND11_MODULE(caliby, m) {
     m.doc() = "Python bindings for the Calico Index(B-Tree, HNSW)";
-    m.attr("__version__") = "0.1.0.dev20251226011002";
+    m.attr("__version__") = "0.1.0.dev20260106222533";
     
     // Register cleanup function to be called at module unload
     auto cleanup = []() {
@@ -656,6 +657,308 @@ num_threads : int, optional
 
         .def("consolidate_deletes", &DiskANNBase::consolidate_deletes, py::arg("params"),
              "Repairs the graph structure around deleted nodes. This is a potentially long-running operation.");
+
+    // =========================================================================================
+    // IVF+PQ Index Bindings
+    // =========================================================================================
+    
+    using IVFPQIndexType = IVFPQ<L2Distance>;
+
+    py::class_<IVFPQStats>(m, "IVFPQStats")
+        .def(py::init<>())
+        .def_property_readonly("dist_comps", [](const IVFPQStats& s) { return s.dist_comps.load(); })
+        .def_property_readonly("lists_probed", [](const IVFPQStats& s) { return s.lists_probed.load(); })
+        .def_property_readonly("vectors_scanned", [](const IVFPQStats& s) { return s.vectors_scanned.load(); })
+        .def_readonly("num_clusters", &IVFPQStats::num_clusters)
+        .def_readonly("num_subquantizers", &IVFPQStats::num_subquantizers)
+        .def_readonly("list_sizes", &IVFPQStats::list_sizes)
+        .def_readonly("avg_list_size", &IVFPQStats::avg_list_size)
+        .def("__repr__", [](const IVFPQStats& s) {
+            return s.toString();
+        });
+
+    py::class_<IVFPQIndexType>(m, "IVFPQIndex")
+        .def(py::init([](u64 max_elements, size_t dim, u32 num_clusters, u32 num_subquantizers,
+                        u32 retrain_interval, bool skip_recovery, uint32_t index_id,
+                        const std::string& name) {
+            // Ensure system is initialized before creating index
+            initialize_system();
+            return new IVFPQIndexType(max_elements, dim, num_clusters, num_subquantizers,
+                                      retrain_interval, skip_recovery, index_id, name);
+        }),
+             py::arg("max_elements"),
+             py::arg("dim") = 128,
+             py::arg("num_clusters") = 256,
+             py::arg("num_subquantizers") = 8,
+             py::arg("retrain_interval") = 10000,
+             py::arg("skip_recovery") = false,
+             py::arg("index_id") = 0,
+             py::arg("name") = "",
+             R"doc(
+    Initializes a new IVF+PQ index with runtime parameters.
+    
+    Parameters:
+    -----------
+    max_elements : int
+        Maximum number of elements the index can hold.
+    dim : int
+        Dimensionality of vectors (default: 128).
+    num_clusters : int
+        Number of IVF clusters (K, default: 256).
+    num_subquantizers : int
+        Number of PQ subquantizers (M, default: 8). dim must be divisible by this.
+    retrain_interval : int
+        Number of insertions between centroid retraining (default: 10000).
+    skip_recovery : bool
+        If True, rebuild the index from scratch (default: False).
+    index_id : int
+        Index ID for multi-index isolation (default: 0).
+    name : str
+        Optional name identifier for the index (default: "").
+)doc")
+
+        .def("flush", [](IVFPQIndexType& self) {
+            self.flush();
+        }, "Flushes all dirty pages to persistent storage.")
+        
+        .def("get_name", &IVFPQIndexType::getName,
+             "Returns the name of the index.")
+        
+        .def("get_dim", &IVFPQIndexType::getDim,
+             "Returns the dimensionality of vectors managed by the index.")
+        
+        .def("get_count", [](IVFPQIndexType& self) { return self.size(); },
+             "Returns the current number of vectors in the index.")
+        
+        .def("is_trained", &IVFPQIndexType::isTrained,
+             "Returns True if the index has been trained with initial centroids.")
+        
+        .def("train", [](IVFPQIndexType& self, 
+                        py::array_t<float, py::array::c_style | py::array::forcecast> training_data) {
+            if (training_data.ndim() != 2) {
+                throw std::runtime_error("Training data must be 2-dimensional (n_samples, dim)");
+            }
+            const size_t dim = self.getDim();
+            if (training_data.shape(1) != static_cast<py::ssize_t>(dim)) {
+                throw std::runtime_error("Training data has incorrect dimension. Expected " +
+                                        std::to_string(dim) + ", but got " + std::to_string(training_data.shape(1)));
+            }
+            size_t num_samples = training_data.shape(0);
+            self.train(training_data.data(), num_samples);
+        },
+        py::arg("training_data"),
+        R"doc(
+    Trains the IVF centroids and PQ codebooks using the provided training data.
+    Must be called before adding points if the index is not recovered from storage.
+    
+    Parameters:
+    -----------
+    training_data : numpy.ndarray
+        A 2D NumPy array of shape (n_samples, dim) containing training vectors.
+        Recommended to use a representative sample of the dataset (e.g., 10-50k vectors).
+)doc")
+
+        .def("add_points", [](IVFPQIndexType& self,
+                             py::array_t<float, py::array::c_style | py::array::forcecast> items,
+                             size_t num_threads = 0) {
+            if (items.ndim() != 2) {
+                throw std::runtime_error("Input array must be 2-dimensional (n_samples, n_features)");
+            }
+            const size_t dim = self.getDim();
+            if (items.shape(1) != static_cast<py::ssize_t>(dim)) {
+                throw std::runtime_error("Input array has incorrect dimension. Expected " +
+                                        std::to_string(dim) + ", but got " + std::to_string(items.shape(1)));
+            }
+            if (!self.isTrained()) {
+                throw std::runtime_error("Index must be trained before adding points. Call train() first.");
+            }
+            
+            size_t n_items = items.shape(0);
+            // Generate sequential IDs starting from current size
+            std::vector<u32> ids(n_items);
+            u64 start_id = self.size();
+            for (size_t i = 0; i < n_items; ++i) {
+                ids[i] = static_cast<u32>(start_id + i);
+            }
+            
+            self.addPoints(items.data(), ids.data(), n_items, num_threads == 0 ? 1 : num_threads);
+        },
+        py::arg("items"), py::arg("num_threads") = 0,
+        R"doc(
+    Adds a batch of points from a NumPy array to the index in parallel.
+    
+    Parameters:
+    -----------
+    items : numpy.ndarray
+        A 2D NumPy array of shape (num_items, dim) containing the vectors to be added.
+    num_threads : int, optional
+        The number of threads to use for adding points. If 0, defaults to hardware cores (default: 0).
+)doc")
+
+        .def("search_knn", [](IVFPQIndexType& self,
+                             py::array_t<float, py::array::c_style | py::array::forcecast> query,
+                             size_t k, size_t nprobe, bool stats = false) -> py::object {
+            if (query.ndim() != 1) {
+                throw std::runtime_error("Query must be a 1-dimensional NumPy array");
+            }
+            const size_t dim = self.getDim();
+            if (query.shape(0) != static_cast<py::ssize_t>(dim)) {
+                throw std::runtime_error("Query vector has incorrect dimension. Expected " +
+                                        std::to_string(dim) + ", but got " + std::to_string(query.shape(0)));
+            }
+            
+            const float* query_ptr = query.data();
+            std::vector<std::pair<float, u32>> result_vec;
+            if (stats) {
+                result_vec = self.search<true>(query_ptr, k, nprobe);
+            } else {
+                result_vec = self.search<false>(query_ptr, k, nprobe);
+            }
+            
+            py::list labels;
+            py::list distances;
+            for (const auto& pair : result_vec) {
+                distances.append(pair.first);
+                labels.append(pair.second);
+            }
+            
+            return py::make_tuple(py::array(labels), py::array(distances));
+        },
+        py::arg("query"), py::arg("k"), py::arg("nprobe"), py::arg("stats") = false,
+        R"doc(
+    Searches for the k-nearest neighbors for a given query vector.
+    
+    Parameters:
+    -----------
+    query : numpy.ndarray
+        A 1D NumPy array of shape (dim,) containing the query vector.
+    k : int
+        The number of nearest neighbors to return.
+    nprobe : int
+        The number of clusters to probe during search (higher = more accurate but slower).
+    stats : bool, optional
+        If True, update statistics counters (default: False).
+    
+    Returns:
+    --------
+    tuple[numpy.ndarray, numpy.ndarray]
+        A tuple of (labels, distances) arrays.
+)doc")
+
+        .def("search_knn_parallel", [](IVFPQIndexType& self,
+                                       py::array_t<float, py::array::c_style | py::array::forcecast> queries,
+                                       size_t k, size_t nprobe, size_t num_threads = 0,
+                                       bool stats = false) -> py::object {
+            if (queries.ndim() != 2) {
+                throw std::runtime_error("Queries must be a 2-dimensional NumPy array of shape (num_queries, dim)");
+            }
+            const size_t dim = self.getDim();
+            if (queries.shape(1) != static_cast<py::ssize_t>(dim)) {
+                throw std::runtime_error("Query vectors have incorrect dimension. Expected " +
+                                        std::to_string(dim) + ", but got " + std::to_string(queries.shape(1)));
+            }
+            if (k == 0) {
+                throw std::runtime_error("k must be > 0");
+            }
+            
+            size_t num_queries = queries.shape(0);
+            if (num_queries == 0) {
+                std::vector<ssize_t> shape = {0, static_cast<ssize_t>(k)};
+                py::array_t<int64_t> empty_labels(shape);
+                py::array_t<float> empty_distances(shape);
+                return py::make_tuple(empty_labels, empty_distances);
+            }
+            
+            std::span<const float> query_span(queries.data(), queries.size());
+            std::vector<std::vector<std::pair<float, u32>>> all_results_vec;
+            if (stats) {
+                all_results_vec = self.searchBatch<true>(query_span, k, nprobe, num_threads);
+            } else {
+                all_results_vec = self.searchBatch<false>(query_span, k, nprobe, num_threads);
+            }
+            
+            std::vector<ssize_t> result_shape = {static_cast<ssize_t>(num_queries), static_cast<ssize_t>(k)};
+            py::array_t<int64_t> labels_arr(result_shape);
+            py::array_t<float> distances_arr(result_shape);
+            
+            auto labels_ptr = labels_arr.mutable_data();
+            auto distances_ptr = distances_arr.mutable_data();
+            
+            for (size_t i = 0; i < num_queries; ++i) {
+                const auto& results_for_one_query = all_results_vec[i];
+                for (size_t j = 0; j < k; ++j) {
+                    if (j < results_for_one_query.size()) {
+                        distances_ptr[i * k + j] = results_for_one_query[j].first;
+                        labels_ptr[i * k + j] = static_cast<int64_t>(results_for_one_query[j].second);
+                    } else {
+                        distances_ptr[i * k + j] = std::numeric_limits<float>::infinity();
+                        labels_ptr[i * k + j] = -1;
+                    }
+                }
+            }
+            
+            return py::make_tuple(labels_arr, distances_arr);
+        },
+        py::arg("queries"), py::arg("k"), py::arg("nprobe"), py::arg("num_threads") = 0,
+        py::arg("stats") = false,
+        R"doc(
+    Searches for the k-nearest neighbors for a batch of query vectors in parallel.
+    
+    Parameters:
+    -----------
+    queries : numpy.ndarray
+        A 2D NumPy array of shape (num_queries, dim) containing the query vectors.
+    k : int
+        The number of nearest neighbors to return.
+    nprobe : int
+        The number of clusters to probe during search.
+    num_threads : int, optional
+        The number of threads to use for searching. If 0, defaults to hardware cores (default: 0).
+    stats : bool, optional
+        If True, update statistics counters (default: False).
+    
+    Returns:
+    --------
+    tuple[numpy.ndarray, numpy.ndarray]
+        A tuple containing:
+        - labels: Array of shape (num_queries, k) with int64 IDs of nearest neighbors.
+        - distances: Array of shape (num_queries, k) with float32 distances.
+)doc")
+
+        .def("get_stats", [](IVFPQIndexType& self) -> py::dict {
+            IVFPQStats stats = self.getStats();
+            py::dict result;
+            result["dist_comps"] = stats.dist_comps.load();
+            result["lists_probed"] = stats.lists_probed.load();
+            result["vectors_scanned"] = stats.vectors_scanned.load();
+            result["num_clusters"] = stats.num_clusters;
+            result["num_subquantizers"] = stats.num_subquantizers;
+            result["list_sizes"] = py::cast(stats.list_sizes);
+            result["avg_list_size"] = stats.avg_list_size;
+            return result;
+        },
+        R"doc(
+    Returns a dictionary containing performance and index statistics.
+    
+    Returns:
+    --------
+    dict:
+        A dictionary with the following keys:
+        - 'dist_comps': Total number of distance computations.
+        - 'lists_probed': Total number of inverted lists probed.
+        - 'vectors_scanned': Total number of vectors scanned.
+        - 'num_clusters': Number of IVF clusters (K).
+        - 'num_subquantizers': Number of PQ subquantizers (M).
+        - 'list_sizes': List with the size of each inverted list.
+        - 'avg_list_size': Average number of vectors per inverted list.
+)doc")
+
+        .def("reset_stats", &IVFPQIndexType::resetStats,
+             "Resets live statistics counters.")
+        
+        .def("get_stats_string", [](IVFPQIndexType& self) {
+            return self.getStats().toString();
+        }, "Returns a formatted string of current statistics.");
 
     // =========================================================================================
     // Index Catalog Bindings

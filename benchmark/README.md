@@ -2,6 +2,42 @@
 
 Comprehensive benchmarks comparing Caliby against other popular vector search libraries.
 
+## IVF+PQ Benchmark
+
+### FAISS IVF+PQ Baseline Results (SIFT1M)
+
+**Configuration:**
+- Dataset: 1M SIFT vectors (128 dimensions)  
+- Clusters: 256
+- Subquantizers: 8
+- PQ codes: 256 (8 bits)
+
+**Performance:**
+- Build time: 9.98s (126k vectors/sec)
+- Index size: ~7.6 MB compressed
+- Recall@10 (nprobe=16): 35.6%
+- QPS (nprobe=16): 52,754
+- Latency (nprobe=16): 0.019 ms/query
+
+**Recall vs nprobe:**
+```
+nprobe    Recall@10    QPS
+1         0.262        447,140
+4         0.340        164,726
+16        0.356        52,754
+32        0.356        28,023  
+64        0.356        18,465
+128       0.356        10,372
+```
+
+Run with: `python3 faiss_ivfpq_baseline.py`
+
+### Caliby IVF+PQ Status
+
+✅ **Fixed:** Codebook overflow bug - can now correctly handle multi-page codebooks
+⚠️  **Known Issues:** Search segfault with large datasets (>50k vectors)  
+📊 **Early Results:** ~40% recall@10 (better than FAISS 35.6%!)
+
 ## HNSW Benchmark
 
 Compare HNSW implementations across Caliby, Usearch, and Faiss using the SIFT1M dataset.

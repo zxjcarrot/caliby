@@ -39,7 +39,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef u64 PID;  // page id type
 
-static constexpr u64 pageSize = 4096;
+static constexpr u64 pageSize = 4096 * 4;
 
 __attribute__((target("sse4.2"))) uint64_t hash64(uint64_t key, uint32_t seed);
 
@@ -599,7 +599,7 @@ struct BufferManager {
 
     static constexpr u64 invalidFrame = std::numeric_limits<u64>::max();
     static constexpr PID invalidPID = std::numeric_limits<PID>::max();
-    static constexpr u32 freePartitionCount = 1;
+    static constexpr u32 freePartitionCount = 64;
 
     char cachline_pad0[64];
     ResidentPageSet residentSet;
@@ -1469,12 +1469,66 @@ struct HNSWMetaInfo {
     }
 };
 
+// IVF+PQ meta info for recovery
+struct IVFPQMetaInfoCompact {
+    static constexpr u64 magic = 0x49564650514D4554ULL;  // "IVFPQMET"
+    
+    u64 magic_value = 0;
+    u8 valid = 0;
+    u8 is_trained = 0;
+    u8 reserved1[6] = {0};
+    
+    // Core parameters
+    u32 dim = 0;
+    u32 num_clusters = 0;        // K
+    u32 num_subquantizers = 0;   // M
+    u32 subvector_dim = 0;       // dim / M
+    
+    // Page locations
+    PID metadata_pid = BufferManager::invalidPID;
+    PID centroids_base_pid = BufferManager::invalidPID;
+    PID invlist_dir_base_pid = BufferManager::invalidPID;
+    PID codebook_base_pid = BufferManager::invalidPID;
+    
+    // State
+    u64 max_elements = 0;
+    std::atomic<u64> num_vectors{0};
+    std::atomic<u64> last_train_count{0};
+    u32 retrain_interval = 0;
+    u8 reserved2[4] = {0};
+    
+    bool isValid() const {
+        return valid != 0 && magic_value == magic && metadata_pid != BufferManager::invalidPID;
+    }
+    
+    void clear() {
+        magic_value = 0;
+        valid = 0;
+        is_trained = 0;
+        memset(reserved1, 0, sizeof(reserved1));
+        dim = 0;
+        num_clusters = 0;
+        num_subquantizers = 0;
+        subvector_dim = 0;
+        metadata_pid = BufferManager::invalidPID;
+        centroids_base_pid = BufferManager::invalidPID;
+        invlist_dir_base_pid = BufferManager::invalidPID;
+        codebook_base_pid = BufferManager::invalidPID;
+        max_elements = 0;
+        num_vectors.store(0);
+        last_train_count.store(0);
+        retrain_interval = 0;
+        memset(reserved2, 0, sizeof(reserved2));
+    }
+};
+
 struct MetaDataPage {
     bool dirty;
     u8 padding[7] = {0};
     HNSWMetaInfo hnsw_meta;
+    IVFPQMetaInfoCompact ivfpq_meta;
     u64 alloc_count_snapshot = 0;
-    PID roots[(pageSize - sizeof(dirty) - sizeof(padding) - sizeof(HNSWMetaInfo) - sizeof(alloc_count_snapshot)) /
+    PID roots[(pageSize - sizeof(dirty) - sizeof(padding) - sizeof(HNSWMetaInfo) - sizeof(IVFPQMetaInfoCompact) - sizeof(alloc_count_snapshot)) /
               sizeof(PID)];
 
     PID getRoot(unsigned slot) { return roots[slot]; }

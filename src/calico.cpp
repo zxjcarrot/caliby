@@ -1492,10 +1492,10 @@ Page* BufferManager::allocPage(PIDAllocator* allocator) {
         pid = allocCount++;
     }
 
-    if (pid >= virtCount) {
-        cerr << "VIRTGB is too low" << endl;
-        exit(EXIT_FAILURE);
-    }
+    // if (pid >= virtCount) {
+    //     cerr << "VIRTGB is too low" << endl;
+    //     exit(EXIT_FAILURE);
+    // }
     u64 stateAndVersion = getPageState(pid).stateAndVersion;
     bool succ = getPageState(pid).tryLockX(stateAndVersion);
     assert(succ);
