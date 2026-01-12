@@ -14,19 +14,12 @@ Caliby is a high-performance vector similarity search library that efficiently h
 - **💾 Larger-Than-Memory**: Seamlessly handles datasets that exceed RAM with minimal performance loss
 - **🎯 Multiple Index Types**: HNSW, DiskANN, and IVF indexes with unified API
 - **🐍 Python First**: Native Python bindings with NumPy integration
-- **⚡ Zero-Copy**: Direct memory access without serialization overhead
 - **🔧 Embeddable**: Single-process library, no server required
-- **💪 Production Ready**: Persistent storage, crash recovery, concurrent access
 
 ## 🚀 Quick Start
 
 ### Installation
-
-```bash
-pip install caliby
-```
-
-Or build from source:
+Build from source:
 
 ```bash
 git clone https://github.com/zxjcarrot/caliby.git
