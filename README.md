@@ -12,7 +12,7 @@ Caliby is a high-performance vector similarity search library that efficiently h
 
 - **🔥 In-Memory Speed**: Matches or exceeds HNSWLib/Faiss/Usearch performance when data fits in memory
 - **💾 Larger-Than-Memory**: Seamlessly handles datasets that exceed RAM with minimal performance loss
-- **🎯 Multiple Index Types**: HNSW, DiskANN, and IVF indexes with unified API
+- **🎯 Multiple Index Types**: HNSW and IVF+PQ indexes with unified API
 - **🐍 Python First**: Native Python bindings with NumPy integration
 - **🔧 Embeddable**: Single-process library, no server required
 
@@ -58,79 +58,109 @@ git submodule update --init --recursive
 import caliby
 import numpy as np
 
+# Initialize the system and configure buffer pool
+caliby.set_buffer_config(size_gb=1.0)  # Set buffer pool size
+caliby.open('/tmp/caliby_data')  # Initialize catalog
+
 # Create an HNSW index
-index = caliby.HNSWIndex(
+index = caliby.HnswIndex(
     max_elements=1_000_000,     # Maximum number of vectors
     dim=128,                    # Vector dimension
     M=16,                       # HNSW parameter (connections per node)
     ef_construction=200,        # Construction-time search depth
+    enable_prefetch=True,       # Enable prefetching for performance
     skip_recovery=False,        # Whether to skip recovery from disk
     index_id=0,                 # Unique index identifier for multi-index
     name='user_embeddings',     # Optional human-readable name
 )
 
-# Add vectors
+# Add vectors (batch)
 vectors = np.random.rand(10000, 128).astype(np.float32)
-index.add_points(vectors)
+index.add_points(vectors, num_threads=4)  # Parallel insertion
 
-# Get index name
+# Get index info
 print(f"Index name: {index.get_name()}")  # Output: 'user_embeddings'
+print(f"Dimension: {index.get_dim()}")
 
-# Search
+# Search (single query)
 query = np.random.rand(128).astype(np.float32)
-labels, distances = index.search_knn(query, k=10, ef_search=50)
+labels, distances = index.search_knn(query, k=10, ef_search_param=50)
 
-# Batch search
+# Batch search (parallel)
 queries = np.random.rand(100, 128).astype(np.float32)
-results = index.search_knn_parallel(queries, k=10, ef_search=50, num_threads=4)
+results = index.search_knn_parallel(queries, k=10, ef_search_param=50, num_threads=4)
+
+# Close when done
+caliby.close()
 ```
 ## 🏗️ Index Types
 
 ### HNSW (Hierarchical Navigable Small World)
 
-Best for: High recall requirements, moderate dataset sizes
+Best for: High recall requirements, moderate to large dataset sizes
 
 ```python
-index = caliby.HNSWIndex(
+import caliby
+import numpy as np
+
+# Initialize system
+caliby.set_buffer_config(size_gb=2.0)
+caliby.open('/tmp/caliby_data')
+
+index = caliby.HnswIndex(
     max_elements=1_000_000,
     dim=128,
     M=16,                    # Higher = better recall, more memory
     ef_construction=200,     # Higher = better graph quality, slower build
+    enable_prefetch=True,    # Enable prefetching
     skip_recovery=False,
     index_id=0,              # Unique ID for multi-index support
     name='my_vectors',       # Optional human-readable name
 )
 
-# Search with ef_search parameter
-labels, distances = index.search_knn(query, k=10, ef_search=100)
+# Add points
+vectors = np.random.rand(100000, 128).astype(np.float32)
+index.add_points(vectors, num_threads=4)
+
+# Search with ef_search_param
+query = np.random.rand(128).astype(np.float32)
+labels, distances = index.search_knn(query, k=10, ef_search_param=100)
 ```
 
-### DiskANN
+### IVF+PQ (Inverted File with Product Quantization)
 
-Best for: Very large datasets, SSD-optimized access patterns
-
-```python
-index = caliby.DiskANNIndex(
-    dim=128,
-    max_elements=100_000_000,
-    R=64,                    # Graph degree
-    L=100,                   # Search list size
-    alpha=1.2,               # Pruning parameter
-)
-```
-
-### IVF (Inverted File Index)
-
-Best for: Extremely large datasets, when some recall loss is acceptable
+Best for: Very large datasets (10M+ vectors), memory-constrained environments
 
 ```python
-index = caliby.IVFIndex(
+import caliby
+import numpy as np
+
+# Initialize system with buffer pool
+caliby.set_buffer_config(size_gb=0.5)  # Small buffer for large datasets
+caliby.open('/tmp/caliby_data')
+
+index = caliby.IVFPQIndex(
+    max_elements=10_000_000,
     dim=128,
-    max_elements=1_000_000_000,
-    n_lists=4096,            # Number of clusters
-    n_probe=32,              # Clusters to search
-    quantizer='flat',        # 'flat', 'pq', 'sq'
+    num_clusters=256,           # Number of IVF clusters (K)
+    num_subquantizers=8,        # Number of PQ subquantizers (M), dim must be divisible by this
+    retrain_interval=10000,     # Retrain centroids every N insertions
+    skip_recovery=False,
+    index_id=0,
+    name='large_dataset'
 )
+
+# Train the index first (required for IVF+PQ)
+training_data = np.random.rand(50000, 128).astype(np.float32)
+index.train(training_data)
+
+# Add points (after training)
+vectors = np.random.rand(1000000, 128).astype(np.float32)
+index.add_points(vectors, num_threads=4)
+
+# Search with nprobe parameter
+query = np.random.rand(128).astype(np.float32)
+labels, distances = index.search_knn(query, k=10, nprobe=8)
 ```
 
 ## 🔧 Advanced Configuration
@@ -140,15 +170,22 @@ index = caliby.IVFIndex(
 Create and manage multiple independent indexes with unique IDs and names:
 
 ```python
+import caliby
+import numpy as np
+
+# Initialize system once
+caliby.set_buffer_config(size_gb=2.0)
+caliby.open('/tmp/caliby_data')
+
 # Create multiple indexes with unique IDs and names
-user_index = caliby.HNSWIndex(
+user_index = caliby.HnswIndex(
     max_elements=100_000, dim=128, M=16, ef_construction=200,
-    skip_recovery=True, index_id=1, name='user_embeddings'
+    enable_prefetch=True, skip_recovery=True, index_id=1, name='user_embeddings'
 )
 
-product_index = caliby.HNSWIndex(
+product_index = caliby.HnswIndex(
     max_elements=200_000, dim=256, M=16, ef_construction=200,
-    skip_recovery=True, index_id=2, name='product_embeddings'
+    enable_prefetch=True, skip_recovery=True, index_id=2, name='product_embeddings'
 )
 
 # Access index by name
@@ -156,24 +193,53 @@ print(f"Working with: {user_index.get_name()}")
 print(f"Dimension: {user_index.get_dim()}")
 
 # Each index operates independently
-user_index.add_points(user_vectors)
-product_index.add_points(product_vectors)
+user_vectors = np.random.rand(10000, 128).astype(np.float32)
+product_vectors = np.random.rand(15000, 256).astype(np.float32)
+user_index.add_points(user_vectors, num_threads=4)
+product_index.add_points(product_vectors, num_threads=4)
 ```
 ### Persistence & Recovery
 
 ```python
-# Indexes are automatically persisted
-index = caliby.HNSWIndex(
-    storage_path='./my_index',
-    sync_on_add=False,           # Batch writes for performance
+import caliby
+
+# Indexes are automatically persisted via the buffer pool
+caliby.set_buffer_config(size_gb=1.0)
+caliby.open('/path/to/caliby_data')  # Data directory for persistent storage
+
+# Create index (will be persisted automatically)
+index = caliby.HnswIndex(
+    max_elements=1_000_000,
+    dim=128,
+    M=16,
+    ef_construction=200,
+    enable_prefetch=True,
+    skip_recovery=False,  # Set to False to enable recovery
+    index_id=1,
+    name='my_index'
 )
 
-# Manual checkpoint
-index.checkpoint()
+# Manual flush to ensure all data is written
+index.flush()
 
-# Recovery happens automatically on load
-index = caliby.HNSWIndex.load('./my_index')
-print(f"Recovered {index.count()} vectors")
+# Recovery happens automatically when reopening with same directory
+caliby.close()
+
+# Later: reopen and recover
+caliby.open('/path/to/caliby_data')
+recovered_index = caliby.HnswIndex(
+    max_elements=1_000_000,
+    dim=128,
+    M=16,
+    ef_construction=200,
+    enable_prefetch=True,
+    skip_recovery=False,  # Will recover existing index
+    index_id=1,  # Must match original
+    name='my_index'
+)
+
+if recovered_index.was_recovered():
+    print("Index successfully recovered from disk!")
 ```
 
 ### Concurrent Access
@@ -194,19 +260,22 @@ with ThreadPoolExecutor(max_workers=8) as executor:
 ```
 caliby/
 ├── include/caliby/          # C++ headers
-│   ├── buffer_pool.hpp      # Core buffer pool
+│   ├── calico.hpp           # Core buffer pool system
 │   ├── hnsw.hpp             # HNSW index
-│   ├── diskann.hpp          # DiskANN index
-│   ├── ivf.hpp              # IVF index
+│   ├── ivfpq.hpp            # IVF+PQ index
+│   ├── diskann.hpp          # DiskANN index (experimental)
+│   ├── catalog.hpp          # Index catalog management
 │   └── distance.hpp         # Distance functions
 ├── src/                     # C++ implementation
-├── python/                  # Python bindings
-│   ├── caliby/              # Python package
-│   └── tests/               # Python tests
+│   ├── bindings.cpp         # Python bindings
+│   ├── hnsw.cpp
+│   ├── ivfpq.cpp
+│   └── calico.cpp
 ├── examples/                # Usage examples
-├── benchmarks/              # Performance benchmarks
-├── docs/                    # Documentation
-└── tests/                   # C++ tests
+├── benchmark/               # Performance benchmarks
+├── tests/                   # Python tests
+└── third_party/             # Dependencies
+    └── pybind11/            # Python binding library (submodule)
 ```
 
 ## 🛠️ Building from Source
