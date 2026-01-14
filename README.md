@@ -18,6 +18,26 @@ Caliby is a high-performance vector similarity search library that efficiently h
 
 ## 🚀 Quick Start
 
+### Prerequisites
+
+Caliby requires the following system dependencies:
+- C++17 compatible compiler (GCC 9+ or Clang 10+)
+- CMake 3.15+
+- OpenMP
+- Abseil C++ library
+- Python 3.8+
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake libomp-dev libabsl-dev python3-dev
+```
+
+**Fedora/RHEL:**
+```bash
+sudo dnf install -y gcc-c++ cmake libomp-devel abseil-cpp-devel python3-devel
+```
+
 ### Installation
 Build from source:
 
