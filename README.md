@@ -42,9 +42,14 @@ sudo dnf install -y gcc-c++ cmake libomp-devel abseil-cpp-devel python3-devel
 Build from source:
 
 ```bash
-git clone https://github.com/zxjcarrot/caliby.git
+git clone --recursive https://github.com/zxjcarrot/caliby.git
 cd caliby
 pip install -e .
+```
+
+**Note:** The `--recursive` flag is required to initialize the pybind11 submodule. If you already cloned without it, run:
+```bash
+git submodule update --init --recursive
 ```
 
 ### Basic Usage
