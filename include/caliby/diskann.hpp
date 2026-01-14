@@ -284,6 +284,10 @@ class DiskANN : public DiskANNBase {
 
     bool get_nodes_data_batch(const std::vector<uint32_t>& ids, NodeDataBatch& data_batch) const;
     bool get_vectors_batch(const std::vector<uint32_t>& ids, T* dest_buffer) const;
+    
+    // Compute distances directly from page memory without copying vectors
+    bool compute_distances_batch(const std::vector<uint32_t>& ids, const T* query,
+                                 std::vector<std::pair<float, uint32_t>>& distances_out) const;
 
     // MODIFIED: Signature updated to accept pre-fetched start node vector
     std::vector<std::pair<float, uint32_t>> greedy_search_final(uint32_t start_node_id, const T* start_node_vec,

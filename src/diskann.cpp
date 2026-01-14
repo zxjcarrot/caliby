@@ -11,6 +11,10 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(__AVX2__) && !defined(CALIBY_NO_AVX2)
+#include <immintrin.h>
+#endif
+
 #include "calico.hpp"
 
 static Distance distance_metric = Distance(Metric::L2);
@@ -27,6 +31,8 @@ std::unique_ptr<DiskANNBase> create_index(size_t dimensions, uint64_t max_elemen
             return std::make_unique<DiskANN<float, uint32_t, 32>>(max_elements, R_max_degree, is_dynamic, 0);
         case 64:
             return std::make_unique<DiskANN<float, uint32_t, 64>>(max_elements, R_max_degree, is_dynamic, 0);
+        case 96:
+            return std::make_unique<DiskANN<float, uint32_t, 96>>(max_elements, R_max_degree, is_dynamic, 0);
         case 128:
             return std::make_unique<DiskANN<float, uint32_t, 128>>(max_elements, R_max_degree, is_dynamic, 0);
         case 256:
@@ -282,8 +288,93 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<
                 const auto node_id = items[i].id;
                 const auto out_idx = items[i].out_idx;
                 NodeAccessor acc(g.ptr, idxInPage(node_id, _NodesPerPage), this);
-                memcpy(dest_buffer + out_idx * Dim, acc.getVector(), VectorSize);
+                // Optimized copy using AVX2 for better performance
+                const float* src = acc.getVector();
+                float* dst = dest_buffer + out_idx * Dim;
+                constexpr size_t bytes = VectorSize;
+                
+                #if defined(__AVX2__) && !defined(CALIBY_NO_AVX2)
+                // Use AVX2 for faster copy (256-bit = 32 bytes = 8 floats at a time)
+                if constexpr (bytes >= 32) {
+                    size_t avx_iterations = bytes / 32;
+                    for (size_t j = 0; j < avx_iterations; ++j) {
+                        __m256 v = _mm256_loadu_ps(src + j * 8);
+                        _mm256_storeu_ps(dst + j * 8, v);
+                    }
+                    // Handle remainder
+                    size_t remainder = bytes % 32;
+                    if (remainder > 0) {
+                        memcpy(dst + (avx_iterations * 8), src + (avx_iterations * 8), remainder);
+                    }
+                } else {
+                    memcpy(dst, src, bytes);
+                }
+                #else
+                memcpy(dst, src, bytes);
+                #endif
             }
+        }
+        return true;
+    } catch (const OLCRestartException&) {
+        return false;
+    }
+}
+
+// ========================================================================
+// DIRECT DISTANCE COMPUTATION (NO COPY)
+// ========================================================================
+template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
+bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_distances_batch(
+    const std::vector<uint32_t>& ids,
+    const T* query,
+    std::vector<std::pair<float, uint32_t>>& distances_out) const {
+    if (ids.empty()) return true;
+
+    distances_out.clear();
+    distances_out.reserve(ids.size());
+
+    // Build items sorted by PID for page locality
+    thread_local std::vector<IdWithIdx> items;
+    items.clear();
+    items.reserve(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        items.push_back({getNodePID(ids[i]), ids[i], i});
+    }
+    std::sort(items.begin(), items.end(), [](const IdWithIdx& a, const IdWithIdx& b) { return a.pid < b.pid; });
+
+    // Prefetch unique PIDs
+    thread_local std::vector<PID> pids;
+    pids.clear();
+    pids.reserve(items.size());
+    for (size_t i = 0; i < items.size();) {
+        PID p = items[i].pid;
+        pids.push_back(p);
+        while (i < items.size() && items[i].pid == p) ++i;
+    }
+    if (!pids.empty()) bm.prefetchPages(pids.data(), pids.size());
+
+    // Temporary storage for distances in original order
+    thread_local std::vector<float> temp_distances;
+    temp_distances.resize(ids.size());
+
+    try {
+        size_t i = 0;
+        while (i < items.size()) {
+            PID p = items[i].pid;
+            GuardORelaxed<VamanaPage> g(p);
+            // Compute distances directly from page without copying
+            for (; i < items.size() && items[i].pid == p; ++i) {
+                const auto node_id = items[i].id;
+                const auto out_idx = items[i].out_idx;
+                NodeAccessor acc(g.ptr, idxInPage(node_id, _NodesPerPage), this);
+                const T* vector = acc.getVector();
+                temp_distances[out_idx] = distance_metric.compare(query, vector, Dim);
+            }
+        }
+
+        // Build output in original ID order
+        for (size_t i = 0; i < ids.size(); ++i) {
+            distances_out.emplace_back(temp_distances[i], ids[i]);
         }
         return true;
     } catch (const OLCRestartException&) {
@@ -392,16 +483,14 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
                 }
             }
         } else {
-            thread_local static std::vector<T, AlignedAllocator<T, 32>> neighbor_vectors;
-            neighbor_vectors.resize(unvisited_neighbors_ids.size() * Dim);
-            if (!get_vectors_batch(unvisited_neighbors_ids, neighbor_vectors.data())) {
+            // Compute distances directly without copying vectors
+            thread_local static std::vector<std::pair<float, uint32_t>> distances;
+            if (!compute_distances_batch(unvisited_neighbors_ids, aligned_query, distances)) {
                 for (uint32_t id : unvisited_neighbors_ids) visited_nodes->unvisit(id);
                 continue;
             }
-            for (size_t i = 0; i < unvisited_neighbors_ids.size(); ++i) {
-                const T* vector = neighbor_vectors.data() + i * Dim;
-                float dist = distance_metric.compare(aligned_query, vector, Dim);
-                best_L_nodes.insert(Neighbor(unvisited_neighbors_ids[i], dist));
+            for (const auto& [dist, id] : distances) {
+                best_L_nodes.insert(Neighbor(id, dist));
             }
         }
     }
@@ -458,17 +547,15 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         }
         if (unvisited_neighbors_ids.empty()) continue;
 
-        thread_local static std::vector<T, AlignedAllocator<T, 32>> neighbor_vectors;
-        neighbor_vectors.resize(unvisited_neighbors_ids.size() * Dim);
-        if (!get_vectors_batch(unvisited_neighbors_ids, neighbor_vectors.data())) {
+        // Compute distances directly without copying vectors
+        thread_local static std::vector<std::pair<float, uint32_t>> distances;
+        if (!compute_distances_batch(unvisited_neighbors_ids, aligned_query, distances)) {
             for (uint32_t id : unvisited_neighbors_ids) visited_nodes->unvisit(id);
             continue;
         }
 
-        for (size_t i = 0; i < unvisited_neighbors_ids.size(); ++i) {
-            const T* vector = neighbor_vectors.data() + i * Dim;
-            float dist = distance_metric.compare(aligned_query, vector, Dim);
-            best_L_nodes.insert(Neighbor(unvisited_neighbors_ids[i], dist));
+        for (const auto& [dist, id] : distances) {
+            best_L_nodes.insert(Neighbor(id, dist));
         }
     }
 
@@ -1327,6 +1414,7 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter_parallel_typed(const T
 template class DiskANN<float, uint32_t, 16>;
 template class DiskANN<float, uint32_t, 32>;
 template class DiskANN<float, uint32_t, 64>;
+template class DiskANN<float, uint32_t, 96>;
 template class DiskANN<float, uint32_t, 128>;
 template class DiskANN<float, uint32_t, 256>;
 template class DiskANN<float, uint32_t, 384>;
