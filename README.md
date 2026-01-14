@@ -127,6 +127,54 @@ query = np.random.rand(128).astype(np.float32)
 labels, distances = index.search_knn(query, k=10, ef_search_param=100)
 ```
 
+### DiskANN (Vamana Graph)
+
+Best for: Filtered search, dynamic updates, very large graphs with tags/labels
+
+```python
+import caliby
+import numpy as np
+
+# Initialize system
+caliby.set_buffer_config(size_gb=2.0)
+caliby.open('/tmp/caliby_data')
+
+# Create DiskANN index
+index = caliby.DiskANN(
+    dimensions=128,
+    max_elements=1_000_000,
+    R_max_degree=64,    # Max graph degree (R)
+    is_dynamic=True     # Enable dynamic inserts/deletes
+)
+
+# Build index with tags for filtering
+vectors = np.random.rand(100000, 128).astype(np.float32)
+tags = [[i % 100] for i in range(100000)]  # Tags for filtering
+
+params = caliby.BuildParams()
+params.L_build = 100       # Build-time search depth
+params.alpha = 1.2         # Alpha parameter for Vamana
+params.num_threads = 4
+
+index.build(vectors, tags, params)
+
+# Search with params
+search_params = caliby.SearchParams(L_search=50)
+search_params.beam_width = 4
+
+query = np.random.rand(128).astype(np.float32)
+labels, distances = index.search(query, K=10, params=search_params)
+
+# Filtered search (only return vectors with specific tag)
+labels, distances = index.search_with_filter(query, filter_label=42, K=10, params=search_params)
+
+# Dynamic operations (if is_dynamic=True)
+new_point = np.random.rand(128).astype(np.float32)
+index.insert_point(new_point, tags=[99], external_id=100000)
+index.lazy_delete(external_id=100000)
+index.consolidate_deletes(params)
+```
+
 ### IVF+PQ (Inverted File with Product Quantization)
 
 Best for: Very large datasets (10M+ vectors), memory-constrained environments
