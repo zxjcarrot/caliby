@@ -81,4 +81,12 @@ catalog.dat
 out.perf-folded
 flamegraph.svg
 caliby_flamegraph.svg
+benchmark_flamegraph.svg
 out.folded
+test_output.txt
+profile_flamegraph.svg
+output.txt
+
+# Analysis and test documentation
+analyze_vectors.py
+HOLE_PUNCHING_TESTS.md
