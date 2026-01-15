@@ -168,8 +168,15 @@ void MultiFileStorage::write_page(uint32_t index_id, uint64_t local_page_id, con
     }
 }
 
-std::string MultiFileStorage::make_index_filename(const std::string& index_name) const {
-    return "caliby_idx_" + index_name + ".dat";
+std::string MultiFileStorage::make_index_filename(IndexType type, uint32_t index_id, const std::string& index_name) const {
+    std::string type_str;
+    switch (type) {
+        case IndexType::HNSW:    type_str = "hnsw"; break;
+        case IndexType::DISKANN: type_str = "diskann"; break;
+        case IndexType::IVF:     type_str = "ivf"; break;
+        default:                 type_str = "unknown"; break;
+    }
+    return "caliby_" + type_str + "_" + std::to_string(index_id) + "_" + index_name + ".dat";
 }
 
 bool MultiFileStorage::delete_file(const std::string& filename) {
@@ -554,7 +561,7 @@ IndexHandle IndexCatalog::create_index(const std::string& name, IndexType type,
     std::strncpy(entry.name, name.c_str(), MAX_INDEX_NAME_LEN - 1);
     
     // Create index file
-    std::string filename = storage_.make_index_filename(name);
+    std::string filename = storage_.make_index_filename(type, index_id, name);
     std::strncpy(entry.file_path, filename.c_str(), MAX_FILE_PATH_LEN - 1);
     
     // Store type-specific metadata

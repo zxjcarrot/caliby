@@ -208,8 +208,8 @@ private:
 ```
 <data_dir>/
 ├── caliby_catalog           # Catalog metadata (index_id=0)
-├── caliby_idx_<name>.dat    # Index data files
-└── caliby_idx_<name>.wal    # Optional WAL files
+├── caliby_<type>_<id>_<name>.dat    # Index data files (e.g., caliby_diskann_1_myindex.dat)
+└── caliby_<type>_<id>_<name>.wal    # Optional WAL files
 ```
 
 ### File Handle Management

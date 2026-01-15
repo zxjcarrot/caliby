@@ -123,6 +123,16 @@ u64 IndexCatalog::getAllocCount(u32 index_id) const {
     return 0;  // Default starting value
 }
 
+int IndexCatalog::getFileFd(u32 index_id) const {
+    std::shared_lock<std::shared_mutex> lock(mutex);
+    
+    auto it = entries.find(index_id);
+    if (it != entries.end()) {
+        return it->second.file_fd;
+    }
+    return -1;  // Not found
+}
+
 void IndexCatalog::persist() {
     std::shared_lock<std::shared_mutex> lock(mutex);
     
@@ -184,6 +194,12 @@ void IndexCatalog::load() {
     ifs.close();
     std::cerr << "[IndexCatalog] Loaded " << num_entries << " entries from " 
               << catalog_file_path << std::endl;
+}
+
+void IndexCatalog::clear() {
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    entries.clear();
+    std::cerr << "[IndexCatalog] Cleared all entries" << std::endl;
 }
 
 //=============================================================================
@@ -410,7 +426,32 @@ void TwoLevelPageStateArray::unregisterIndex(u32 indexId) {
     // Delete the array
     delete arr;
     
+    // Increment generation to invalidate all thread-local caches
+    generation.fetch_add(1, std::memory_order_release);
+    
     std::cerr << "[TwoLevelPageStateArray] Unregistered index " << indexId << std::endl;
+}
+
+void TwoLevelPageStateArray::unregisterAllNonZero() {
+    std::unique_lock<std::shared_mutex> lock(indexMutex);
+    
+    int unregisteredCount = 0;
+    for (u32 i = 1; i < numIndexSlots; ++i) {
+        IndexTranslationArray* arr = indexArrays[i].load(std::memory_order_acquire);
+        if (arr != nullptr) {
+            indexArrays[i].store(nullptr, std::memory_order_release);
+            delete arr;
+            unregisteredCount++;
+        }
+    }
+    
+    if (unregisteredCount > 0) {
+        // Increment generation to invalidate all thread-local caches
+        generation.fetch_add(1, std::memory_order_release);
+        
+        std::cerr << "[TwoLevelPageStateArray] Unregistered " << unregisteredCount 
+                  << " non-zero indexes" << std::endl;
+    }
 }
 
 bool TwoLevelPageStateArray::isIndexRegistered(u32 indexId) const {
@@ -1007,13 +1048,20 @@ PIDAllocator* BufferManager::getOrCreateAllocatorForIndex(u32 index_id, u64 max_
     // Initialize from catalog
     u64 saved_alloc_count = indexCatalog->getAllocCount(index_id);
     
+    // Get file descriptor from catalog (or fall back to global blockfd)
+    int index_fd = indexCatalog->getFileFd(index_id);
+    if (index_fd < 0) {
+        index_fd = blockfd;  // Fall back to global heapfile if no per-index file
+    }
+    
     // Register index in the translation array (Array2Level mode)
     if (hashMode == HashMode::Array2Level && pageState2Level) {
         if (!pageState2Level->isIndexRegistered(index_id)) {
-            pageState2Level->registerIndex(index_id, max_pages, saved_alloc_count, blockfd);
+            pageState2Level->registerIndex(index_id, max_pages, saved_alloc_count, index_fd);
             std::cerr << "[BufferManager] Registered index " << index_id 
                       << " in TwoLevelPageStateArray with max_pages=" << max_pages 
-                      << " initial_alloc=" << saved_alloc_count << std::endl;
+                      << " initial_alloc=" << saved_alloc_count 
+                      << " fd=" << index_fd << std::endl;
         }
     }
     
@@ -1816,8 +1864,8 @@ void BufferManager::flushAll() {
         locked_states.clear();
     };
 
-    u64 max_pid = allocCount.load(std::memory_order_acquire);
-    for (PID pid = 0; pid < max_pid; ++pid) {
+    // Lambda to flush pages for a specific global PID
+    auto flush_page = [&](PID pid) {
         PageState& ps = getPageState(pid);
 
         for (u64 repeatCounter = 0;; ++repeatCounter) {
@@ -1853,6 +1901,30 @@ void BufferManager::flushAll() {
 
         if (batch.size() >= LibaioInterface::maxIOs) {
             flush_batch();
+        }
+    };
+
+    // Flush pages for all registered indices in 2-level mode
+    if (pageState2Level) {
+        for (u32 indexId = 0; indexId < pageState2Level->numIndexSlots; ++indexId) {
+            IndexTranslationArray* arr = pageState2Level->getIndexArray(indexId);
+            if (arr) {
+                u64 indexAllocCount = arr->allocCount.load(std::memory_order_acquire);
+                // Use min of allocCount and capacity to avoid overflow
+                u64 maxPages = std::min(indexAllocCount, arr->capacity);
+                cerr << "[flushAll] Flushing index " << indexId << " with " << maxPages << " pages (allocCount=" << indexAllocCount << ", capacity=" << arr->capacity << ")" << endl;
+                for (u64 localPid = 0; localPid < maxPages; ++localPid) {
+                    // Encode global PID: (indexId << 32) | localPid
+                    PID globalPid = (static_cast<u64>(indexId) << 32) | localPid;
+                    flush_page(globalPid);
+                }
+            }
+        }
+    } else {
+        // Fallback for non-2level mode: iterate over global allocCount
+        u64 max_pid = allocCount.load(std::memory_order_acquire);
+        for (PID pid = 0; pid < max_pid; ++pid) {
+            flush_page(pid);
         }
     }
 

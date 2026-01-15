@@ -69,7 +69,7 @@ class DiskANNBase {
 };
 
 std::unique_ptr<DiskANNBase> create_index(size_t dimensions, uint64_t max_elements, size_t R_max_degree,
-                                          bool is_dynamic);
+                                          bool is_dynamic, uint32_t index_id = 0);
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode = 8>
 class DiskANN : public DiskANNBase {

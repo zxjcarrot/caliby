@@ -366,7 +366,7 @@ public:
     /**
      * Generate filename for an index.
      */
-    std::string make_index_filename(const std::string& index_name) const;
+    std::string make_index_filename(IndexType type, uint32_t index_id, const std::string& index_name) const;
     
     /**
      * Delete an index file.
@@ -509,6 +509,12 @@ public:
      * Get the shared buffer manager.
      */
     BufferManager* buffer_manager() const { return buffer_manager_; }
+    
+    /**
+     * Set the buffer manager for this catalog.
+     * Must be called before initialize() to enable proper index registration.
+     */
+    void setBufferManager(BufferManager* bm_arg) { buffer_manager_ = bm_arg; }
     
     /**
      * Get the multi-file storage layer.

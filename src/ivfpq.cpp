@@ -602,9 +602,13 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
     
     // Calculate total pages needed
     u64 total_pages = 1 + centroid_pages_ + dir_pages_ + codebook_pages_;
-    // Add estimated inverted list pages (generous estimate)
-    u64 estimated_invlist_pages = (max_elements / entries_per_invlist_page_) * 2;
-    total_pages += estimated_invlist_pages;
+    // Add estimated inverted list pages - each cluster gets at least one page,
+    // plus additional pages for overflow (vectors per cluster / entries_per_page)
+    u64 base_invlist_pages = num_clusters_;  // At least one page per cluster
+    u64 overflow_pages = (max_elements / entries_per_invlist_page_) + num_clusters_;
+    total_pages += base_invlist_pages + overflow_pages;
+    // Add some extra headroom for safety
+    total_pages = std::max(total_pages, (u64)(max_elements / 10 + 256));
     
     allocator_ = bm.getOrCreateAllocatorForIndex(index_id_, total_pages);
     
@@ -1138,8 +1142,12 @@ void IVFPQ<DistanceMetric>::train(const float* training_vectors, u64 n_train, u3
     meta_guard->last_train_count.store(0, std::memory_order_release);
     
     // Update global metadata page with trained status
-    if (index_id_ != 0) {
-        PID global_metadata_page_id = (static_cast<PID>(index_id_) << 32) | 0ULL;
+    // For index_id=0, the global metadata page is at PID 0
+    // For index_id>0, it's at (index_id << 32) | 0
+    {
+        PID global_metadata_page_id = (index_id_ > 0) 
+            ? (static_cast<PID>(index_id_) << 32) | 0ULL 
+            : 0ULL;
         GuardX<MetaDataPage> global_meta_guard(global_metadata_page_id);
         IVFPQMetaInfo* meta_info = reinterpret_cast<IVFPQMetaInfo*>(&global_meta_guard.ptr->ivfpq_meta);
         meta_info->is_trained = 1;

@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -101,7 +102,7 @@ using HnswIndexType = HNSW<hnsw_distance::SIMDAcceleratedL2>;
 // --- Python Module Definition ---
 PYBIND11_MODULE(caliby, m) {
     m.doc() = "Python bindings for the Calico Index(B-Tree, HNSW)";
-    m.attr("__version__") = "0.1.0.dev20260114210358";
+    m.attr("__version__") = "0.1.0.dev20260115013508";
     
     // Register cleanup function to be called at module unload
     auto cleanup = []() {
@@ -134,6 +135,16 @@ PYBIND11_MODULE(caliby, m) {
     m.def("open", [](const std::string& data_dir, bool cleanup_if_exist) {
         // Initialize the buffer manager and catalog with the specified directory
         initialize_system();
+        
+        // If cleanup_if_exist, also clear the simple IndexCatalog to prevent stale data
+        // from being used when creating new indexes with explicit index_ids
+        if (cleanup_if_exist && bm_ptr && bm_ptr->indexCatalog) {
+            bm_ptr->indexCatalog->clear();
+        }
+        
+        // Connect catalog to buffer manager for proper index registration
+        // Use &bm to get address of the BufferManager (bm is defined as *bm_ptr)
+        caliby::IndexCatalog::instance().setBufferManager(&bm);
         caliby::IndexCatalog::instance().initialize(data_dir, cleanup_if_exist);
     }, py::arg("data_dir"), py::arg("cleanup_if_exist") = false,
     "Open caliby with a specific data directory for storing index files and catalog. "
@@ -148,6 +159,12 @@ PYBIND11_MODULE(caliby, m) {
         // Flush all changes and shutdown catalog
         flush_system();
         caliby::IndexCatalog::instance().shutdown();
+        
+        // Unregister all non-zero indexes from the BufferManager
+        // This allows open() to be called again with fresh state
+        if (bm_ptr != nullptr) {
+            bm_ptr->unregisterAllNonZero();
+        }
     },
     "Close caliby, flushing all changes and releasing the data directory lock. "
     "Should be called before program exit for clean shutdown.");
@@ -180,8 +197,31 @@ PYBIND11_MODULE(caliby, m) {
                                 const std::string& name) {
                     // Ensure system is initialized before creating index
                     initialize_system();
+                    
+                    uint32_t final_index_id = index_id;
+                    std::string final_name = name;
+                    
+                    // If index_id is 0 and catalog is initialized, create a catalog entry
+                    caliby::IndexCatalog& catalog = caliby::IndexCatalog::instance();
+                    if (final_index_id == 0 && catalog.is_initialized()) {
+                        // Generate a name if not provided
+                        if (final_name.empty()) {
+                            final_name = "hnsw_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                        }
+                        
+                        // Create catalog entry which sets up per-index file
+                        caliby::IndexHandle handle = catalog.create_hnsw_index(
+                            final_name, 
+                            static_cast<uint32_t>(dim),
+                            max_elements,
+                            M,
+                            ef_construction
+                        );
+                        final_index_id = handle.index_id();
+                    }
+                    
                     return new HnswIndexType(max_elements, dim, M, ef_construction,
-                                           enable_prefetch, skip_recovery, index_id, name);
+                                           enable_prefetch, skip_recovery, final_index_id, final_name);
                 }),
                          py::arg("max_elements"),
                          py::arg("dim") = HNSW_DIM,
@@ -191,7 +231,8 @@ PYBIND11_MODULE(caliby, m) {
                          py::arg("skip_recovery") = false,
                          py::arg("index_id") = 0,
                          py::arg("name") = "",
-                         "Initializes a new, empty HNSW index with runtime parameters. Set skip_recovery to True to rebuild the index from scratch. index_id is used for multi-index isolation. name is an optional identifier for the index.")
+                         "Initializes a new, empty HNSW index with runtime parameters. Set skip_recovery to True to rebuild the index from scratch. index_id is used for multi-index isolation. name is an optional identifier for the index. "
+                         "If caliby.open() was called and index_id is 0, the index will be automatically registered with the catalog.")
         .def(
             "flush",
             [](HnswIndexType&) { flush_system(); },
@@ -481,15 +522,41 @@ num_threads : int, optional
         .def_readwrite("beam_width", &DiskANNBase::SearchParams::beam_width);
 
     py::class_<DiskANNBase, std::unique_ptr<DiskANNBase>>(m, "DiskANN")
-        .def(py::init([](size_t dimensions, uint64_t max_elements, size_t R_max_degree, bool is_dynamic) {
+        .def(py::init([](size_t dimensions, uint64_t max_elements, size_t R_max_degree, bool is_dynamic,
+                         const std::string& name) {
                  // Ensure system is initialized before creating index
                  initialize_system();
-                 // Pass the R_max_degree to the factory function.
-                 return create_index(dimensions, max_elements, R_max_degree, is_dynamic);
+                 
+                 uint32_t index_id = 0;
+                 
+                 // Check if catalog is initialized - if so, create an index entry
+                 caliby::IndexCatalog& catalog = caliby::IndexCatalog::instance();
+                 if (catalog.is_initialized()) {
+                     // Generate a name if not provided
+                     std::string idx_name = name.empty() 
+                         ? "diskann_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
+                         : name;
+                     
+                     // Create catalog entry which sets up per-index file
+                     caliby::IndexHandle handle = catalog.create_diskann_index(
+                         idx_name, 
+                         static_cast<uint32_t>(dimensions),
+                         max_elements,
+                         static_cast<uint32_t>(R_max_degree),
+                         100,  // L_build default
+                         1.2f  // alpha default
+                     );
+                     index_id = handle.index_id();
+                 }
+                 
+                 // Pass the index_id to the factory function.
+                 return create_index(dimensions, max_elements, R_max_degree, is_dynamic, index_id);
              }),
              py::arg("dimensions"), py::arg("max_elements"), py::arg("R_max_degree") = 64,
-             py::arg("is_dynamic") = false,
-             "Initializes a new, empty Vamana index with a specific dimension, capacity, and max graph degree (R).")
+             py::arg("is_dynamic") = false, py::arg("name") = "",
+             "Initializes a new, empty Vamana index with a specific dimension, capacity, and max graph degree (R). "
+             "If caliby.open() was called, the index will be automatically registered with the catalog and data "
+             "will be stored in a per-index file in the catalog directory.")
 
         .def_property_readonly("dimensions", &DiskANNBase::get_dimensions, "Returns the dimension of the index.")
         // *** ADDED HERE ***

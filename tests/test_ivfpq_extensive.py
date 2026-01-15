@@ -591,69 +591,95 @@ class TestIVFPQRecovery:
     """Test persistence and recovery"""
     
     def test_basic_recovery(self):
-        """Test that index can be recovered after close/reopen"""
-        test_dir = tempfile.mkdtemp(prefix='caliby_test_ivfpq_recovery_')
-        dim = 128
-        n_vectors = 2000
+        """Test that index can be recovered after close/reopen.
         
-        try:
-            # Create and populate index
-            caliby.set_buffer_config(0.5, 2.0)
-            caliby.open(test_dir, cleanup_if_exist=True)
-            
-            index = caliby.IVFPQIndex(
-                max_elements=n_vectors + 1000,
-                dim=dim,
-                num_clusters=64,
-                num_subquantizers=8,
-                index_id=1,
-                name="test_recovery"
-            )
-            
-            np.random.seed(42)
-            data = np.random.randn(n_vectors, dim).astype(np.float32)
-            
-            index.train(data)
-            index.add_points(data)
-            
-            # Get search results before close
-            query = data[0]
-            labels_before, distances_before = index.search_knn(query, 10, 16)
-            
-            # Flush and close
-            index.flush()
-            caliby.close()
-            
-            # Reopen
-            caliby.open(test_dir, cleanup_if_exist=False)
-            
-            # Create index with same parameters - should recover
-            index2 = caliby.IVFPQIndex(
-                max_elements=n_vectors + 1000,
-                dim=dim,
-                num_clusters=64,
-                num_subquantizers=8,
-                skip_recovery=False,
-                index_id=1,
-                name="test_recovery"
-            )
-            
-            # Verify recovery
-            assert index2.get_count() == n_vectors
-            assert index2.is_trained()
-            
-            # Search should give similar results
-            labels_after, distances_after = index2.search_knn(query, 10, 16)
-            
-            # At least top result should match
-            assert labels_before[0] == labels_after[0], \
-                f"Top result changed: {labels_before[0]} vs {labels_after[0]}"
-            
-            caliby.close()
-            
-        finally:
-            if os.path.exists(test_dir):
-                shutil.rmtree(test_dir)
+        This test runs in a subprocess to ensure complete isolation
+        from other tests' BufferManager state.
+        """
+        import subprocess
+        import sys
+        
+        # Get the build directory path
+        build_dir = os.path.join(os.path.dirname(__file__), '..', 'build')
+        build_dir = os.path.abspath(build_dir)
+        
+        # Python script to run in subprocess for complete isolation
+        test_script = f'''
+import numpy as np
+import sys
+import os
+sys.path.insert(0, "{build_dir}")
+import caliby
+
+dim = 128
+n_vectors = 2000
+unique_id = 60000
+
+# Create and populate index with unique index_id
+index = caliby.IVFPQIndex(
+    max_elements=n_vectors + 1000,
+    dim=dim,
+    num_clusters=64,
+    num_subquantizers=8,
+    skip_recovery=True,  # Force fresh start
+    index_id=unique_id,
+)
+
+np.random.seed(42)
+data = np.random.randn(n_vectors, dim).astype(np.float32)
+
+index.train(data)
+index.add_points(data)
+
+# Get search results before close
+query = data[0]
+labels_before, distances_before = index.search_knn(query, 10, 16)
+
+# Flush all data to disk
+index.flush()
+caliby.flush_storage()
+
+# Delete the index object to release resources
+del index
+
+# Create a new index with same parameters - should recover from disk
+index2 = caliby.IVFPQIndex(
+    max_elements=n_vectors + 1000,
+    dim=dim,
+    num_clusters=64,
+    num_subquantizers=8,
+    skip_recovery=False,  # Allow recovery
+    index_id=unique_id,
+)
+
+# Verify recovery
+assert index2.get_count() == n_vectors, f"Expected {{n_vectors}} vectors, got {{index2.get_count()}}"
+assert index2.is_trained(), "Index should be trained after recovery"
+
+# Search should give similar results
+labels_after, distances_after = index2.search_knn(query, 10, 16)
+
+# At least top result should match
+assert labels_before[0] == labels_after[0], f"Top result changed: {{labels_before[0]}} vs {{labels_after[0]}}"
+
+print("IVFPQ recovery test PASSED")
+'''
+        
+        # Run the test in a subprocess for complete isolation
+        result = subprocess.run(
+            [sys.executable, '-c', test_script],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(__file__)
+        )
+        
+        # Check if the subprocess succeeded
+        if result.returncode != 0:
+            print("STDOUT:", result.stdout)
+            print("STDERR:", result.stderr)
+            pytest.fail(f"IVFPQ recovery test failed in subprocess:\n{result.stderr}")
+        
+        assert "IVFPQ recovery test PASSED" in result.stdout
 
 
 if __name__ == '__main__':

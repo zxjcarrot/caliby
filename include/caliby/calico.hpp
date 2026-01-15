@@ -228,6 +228,22 @@ struct ResidentPageSet {
     u64 hash(u64 k);
     void insert(u64 pid);
     bool remove(u64 pid);
+    
+    // Remove all pages belonging to indexes with ID >= minIndexId
+    void removeAllForIndexes(u32 minIndexId) {
+        for (u64 i = 0; i < count; ++i) {
+            u64 pid = ht[i].pid.load();
+            if (pid != empty && pid != tombstone) {
+                // Extract index ID from PID (top 32 bits)
+                u32 indexId = static_cast<u32>(pid >> 32);
+                if (indexId >= minIndexId) {
+                    // Try to remove it
+                    u64 expected = pid;
+                    ht[i].pid.compare_exchange_strong(expected, tombstone);
+                }
+            }
+        }
+    }
 
     template <class Fn>
     void iterateClockBatch(u64 batch, Fn fn) {
@@ -365,6 +381,10 @@ struct TwoLevelPageStateArray {
     u32 numIndexSlots;                    // Actual number of slots allocated
     mutable std::shared_mutex indexMutex; // For registering/unregistering indexes
     
+    // Generation counter - incremented when indexes are unregistered
+    // Used to invalidate thread-local caches
+    std::atomic<u64> generation{0};
+    
     // Reference to BufferManager's hole punch counter
     std::atomic<u64>* holePunchCounterPtr;
     
@@ -394,6 +414,12 @@ struct TwoLevelPageStateArray {
     void unregisterIndex(u32 indexId);
     
     /**
+     * Unregister all non-zero indexes (for reset/close).
+     * Index 0 is preserved as the default single-index mode.
+     */
+    void unregisterAllNonZero();
+    
+    /**
      * Check if an index is registered.
      */
     bool isIndexRegistered(u32 indexId) const;
@@ -413,10 +439,14 @@ struct TwoLevelPageStateArray {
         
         // Fast path: use thread-local cache for repeated access to same index
         // The cache stores the last accessed IndexTranslationArray pointer
+        // Also cache generation to detect invalidation
         thread_local u32 cachedIndexId = 0xFFFFFFFF;
         thread_local IndexTranslationArray* cachedArray = nullptr;
+        thread_local u64 cachedGeneration = 0;
         
-        if (cachedIndexId == indexId) {
+        u64 currentGen = generation.load(std::memory_order_acquire);
+        
+        if (cachedIndexId == indexId && cachedGeneration == currentGen && cachedArray != nullptr) {
             // Cache hit - use cached array pointer
             return cachedArray->get(localPageId);
         }
@@ -431,6 +461,7 @@ struct TwoLevelPageStateArray {
         // Update cache
         cachedIndexId = indexId;
         cachedArray = arr;
+        cachedGeneration = currentGen;
         
         return arr->get(localPageId);
     }
@@ -568,6 +599,9 @@ struct IndexCatalog {
     // Get current alloc_count for an index
     u64 getAllocCount(u32 index_id) const;
     
+    // Get file descriptor for an index
+    int getFileFd(u32 index_id) const;
+    
     // Persist catalog to disk
     void persist();
     
@@ -576,6 +610,9 @@ struct IndexCatalog {
     
     // Register a new index
     void registerIndex(u32 index_id, u64 max_pages, int file_fd = -1);
+    
+    // Clear all entries (for cleanup on reinitialization)
+    void clear();
 };
 
 struct BufferManager {
@@ -716,12 +753,17 @@ struct BufferManager {
      * @param fileFd File descriptor for this index's data file (optional, for caching)
      */
     void registerIndex(u32 indexId, u64 maxPages, int fileFd = -1) {
+        // Register with simple IndexCatalog (for fd tracking)
+        if (indexCatalog) {
+            indexCatalog->registerIndex(indexId, maxPages, fileFd);
+        }
+        
         if (hashMode != HashMode::Array2Level || !pageState2Level) {
             // In non-Array2Level modes, we don't need explicit index registration
             // The single translation array handles all PIDs
             return;
         }
-        pageState2Level->registerIndex(indexId, maxPages, fileFd);
+        pageState2Level->registerIndex(indexId, maxPages, 0, fileFd);  // 0 = initialAllocCount
     }
     
     /**
@@ -732,6 +774,38 @@ struct BufferManager {
             return;
         }
         pageState2Level->unregisterIndex(indexId);
+    }
+    
+    /**
+     * Unregister all non-zero indexes (for reset/close).
+     * This allows caliby.open() to be called again with a fresh state.
+     */
+    void unregisterAllNonZero() {
+        if (hashMode != HashMode::Array2Level || !pageState2Level) {
+            return;
+        }
+        
+        // First, clear all per-index allocators (except index 0)
+        {
+            std::unique_lock<std::shared_mutex> lock(catalogMutex);
+            std::vector<u32> toRemove;
+            for (auto& [indexId, allocator] : perIndexAllocators) {
+                if (indexId != 0) {
+                    toRemove.push_back(indexId);
+                }
+            }
+            for (u32 indexId : toRemove) {
+                perIndexAllocators.erase(indexId);
+            }
+        }
+        
+        // Clear resident set entries for non-zero indexes
+        if (useTraditional) {
+            residentSet.removeAllForIndexes(1);  // Remove all pages for index >= 1
+        }
+        
+        // Then unregister from TwoLevelPageStateArray
+        pageState2Level->unregisterAllNonZero();
     }
     
     /**
