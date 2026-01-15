@@ -333,48 +333,32 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_distances_batch(
     distances_out.clear();
     distances_out.reserve(ids.size());
 
-    // Build items sorted by PID for page locality
-    thread_local std::vector<IdWithIdx> items;
-    items.clear();
-    items.reserve(ids.size());
-    for (size_t i = 0; i < ids.size(); ++i) {
-        items.push_back({getNodePID(ids[i]), ids[i], i});
-    }
-    std::sort(items.begin(), items.end(), [](const IdWithIdx& a, const IdWithIdx& b) { return a.pid < b.pid; });
-
-    // Prefetch unique PIDs
-    thread_local std::vector<PID> pids;
-    pids.clear();
-    pids.reserve(items.size());
-    for (size_t i = 0; i < items.size();) {
-        PID p = items[i].pid;
-        pids.push_back(p);
-        while (i < items.size() && items[i].pid == p) ++i;
-    }
-    if (!pids.empty()) bm.prefetchPages(pids.data(), pids.size());
-
-    // Temporary storage for distances in original order
-    thread_local std::vector<float> temp_distances;
-    temp_distances.resize(ids.size());
+    // Collect PIDs and offsets without deduplication for prefetching
+    // thread_local std::vector<PID> pids;
+    // thread_local std::vector<u32> offsets;
+    // pids.clear();
+    // offsets.clear();
+    // pids.reserve(ids.size());
+    // offsets.reserve(ids.size());
+    
+    // for (uint32_t node_id : ids) {
+    //     pids.push_back(getNodePID(node_id));
+    //     offsets.push_back(static_cast<u32>(idxInPage(node_id, _NodesPerPage) * _FixedNodeSize));
+    // }
+    
+    // // Prefetch all pages with vector offsets (no deduplication)
+    // if (!pids.empty()) {
+    //     bm.prefetchPages(pids.data(), pids.size(), offsets.data());
+    // }
 
     try {
-        size_t i = 0;
-        while (i < items.size()) {
-            PID p = items[i].pid;
-            GuardORelaxed<VamanaPage> g(p);
-            // Compute distances directly from page without copying
-            for (; i < items.size() && items[i].pid == p; ++i) {
-                const auto node_id = items[i].id;
-                const auto out_idx = items[i].out_idx;
-                NodeAccessor acc(g.ptr, idxInPage(node_id, _NodesPerPage), this);
-                const T* vector = acc.getVector();
-                temp_distances[out_idx] = distance_metric.compare(query, vector, Dim);
-            }
-        }
-
-        // Build output in original ID order
-        for (size_t i = 0; i < ids.size(); ++i) {
-            distances_out.emplace_back(temp_distances[i], ids[i]);
+        // Process IDs in order
+        for (uint32_t node_id : ids) {
+            GuardORelaxed<VamanaPage> g(getNodePID(node_id));
+            NodeAccessor acc(g.ptr, idxInPage(node_id, _NodesPerPage), this);
+            const T* vector = acc.getVector();
+            float dist = distance_metric.compare(query, vector, Dim);
+            distances_out.emplace_back(dist, node_id);
         }
         return true;
     } catch (const OLCRestartException&) {
@@ -421,17 +405,23 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
     std::vector<uint32_t> all_neighbors_from_beam;
     std::vector<uint32_t> unvisited_neighbors_ids;
     std::vector<PID> pids_to_prefetch;
+    //std::vector<u32> offsets_to_prefetch;
 
     while (best_L_nodes.has_unexpanded_node()) {
         pids_to_prefetch.clear();
+        //offsets_to_prefetch.clear();
         size_t prefetch_count = 0;
         for (size_t i = best_L_nodes._cur; i < best_L_nodes.size() && prefetch_count < params.beam_width; ++i) {
             if (!best_L_nodes[i].expanded) {
-                pids_to_prefetch.push_back(getNodePID(best_L_nodes[i].id));
+                uint32_t node_id = best_L_nodes[i].id;
+                pids_to_prefetch.push_back(getNodePID(node_id));
+                // Offset to neighbors data (after vector + tags)
+                //offsets_to_prefetch.push_back(static_cast<u32>(idxInPage(node_id, _NodesPerPage) * _FixedNodeSize + VectorSize + TagsHeaderSize + TagsDataSize));
                 prefetch_count++;
             }
         }
         if (!pids_to_prefetch.empty()) {
+            //bm.prefetchPages(pids_to_prefetch.data(), pids_to_prefetch.size(), offsets_to_prefetch.data());
             bm.prefetchPages(pids_to_prefetch.data(), pids_to_prefetch.size());
         }
 
@@ -532,9 +522,18 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
     }
 
     std::vector<uint32_t> unvisited_neighbors_ids;
+    std::vector<PID> pids_to_prefetch;
+    std::vector<u32> offsets_to_prefetch;
 
     while (best_L_nodes.has_unexpanded_node()) {
         Neighbor candidate = best_L_nodes.closest_unexpanded();
+
+        // Prefetch the candidate's page with offset to neighbors data
+        pids_to_prefetch.clear();
+        offsets_to_prefetch.clear();
+        pids_to_prefetch.push_back(getNodePID(candidate.id));
+        offsets_to_prefetch.push_back(static_cast<u32>(idxInPage(candidate.id, _NodesPerPage) * _FixedNodeSize + VectorSize + TagsHeaderSize + TagsDataSize));
+        bm.prefetchPages(pids_to_prefetch.data(), 1, offsets_to_prefetch.data());
 
         std::vector<uint32_t> neighbors;
         if (!getNodeNeighbors(candidate.id, neighbors)) continue;
