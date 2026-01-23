@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "caliby"
-version = "0.1.0.dev20260115013508"
+version = "0.1.1"
 description = "High-Performance Disk-Aware Vector Search Library"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.8"
 authors = [
     {name = "Caliby Contributors"}
@@ -25,7 +26,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
@@ -49,10 +49,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/caliby/caliby"
-Documentation = "https://github.com/caliby/caliby#readme"
-Repository = "https://github.com/caliby/caliby"
-Issues = "https://github.com/caliby/caliby/issues"
+Homepage = "https://github.com/zxjcarrot/caliby"
+Documentation = "https://github.com/zxjcarrot/caliby#readme"
+Repository = "https://github.com/zxjcarrot/caliby"
+Issues = "https://github.com/zxjcarrot/caliby/issues"
 
 [tool.setuptools]
 packages = []

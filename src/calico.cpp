@@ -187,6 +187,10 @@ void IndexCatalog::load() {
         ifs.read(reinterpret_cast<char*>(&entry.max_pages), sizeof(entry.max_pages));
         ifs.read(reinterpret_cast<char*>(&entry.file_fd), sizeof(entry.file_fd));
         
+        // Reset file_fd since file descriptors are not portable across processes
+        // The fd will be re-acquired when the index is actually used
+        entry.file_fd = -1;
+        
         entry.alloc_count.store(alloc_count_value, std::memory_order_release);
         entries[entry.index_id] = std::move(entry);
     }
@@ -646,25 +650,56 @@ LibaioInterface::LibaioInterface(int blockfd, BufferManager* bm_ptr) : blockfd(b
 
 void LibaioInterface::writePages(const vector<PID>& pages) {
     assert(pages.size() <= maxIOs);
+    
+    // Filter out pages with invalid file descriptors
+    vector<PID> validPages;
+    vector<u64> validIndices;
+    validPages.reserve(pages.size());
+    validIndices.reserve(pages.size());
+    
     for (u64 i = 0; i < pages.size(); i++) {
         PID pid = pages[i];
         Page* page = bm_ptr->preparePageForWrite(pid);
-        cbPtr[i] = &cb[i];
         
         // Get the correct file descriptor and local page ID for this PID
         PID localPageId;
         int fd = bm_ptr->getFileDescriptorForPID(pid, localPageId);
         
-        io_prep_pwrite(cb + i, fd, page, pageSize, pageSize * localPageId);
+        // Skip pages with invalid file descriptors (may happen during shutdown)
+        if (fd < 0) {
+            continue;
+        }
+        
+        cbPtr[validPages.size()] = &cb[validPages.size()];
+        io_prep_pwrite(cb + validPages.size(), fd, page, pageSize, pageSize * localPageId);
+        validPages.push_back(pid);
+        validIndices.push_back(i);
     }
-    int cnt = io_submit(ctx, pages.size(), cbPtr);
-    if (cnt != (int)pages.size()) {
-        std::cerr << "io_submit failed: " << cnt << " expected: " << pages.size() << " errno: " << -cnt << std::endl;
-        exit(EXIT_FAILURE);
+    
+    if (validPages.empty()) {
+        return;  // Nothing to write
     }
-    cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
-    if (cnt != (int)pages.size()) {
-        std::cerr << "io_getevents failed: " << cnt << " expected: " << pages.size() << " errno: " << -cnt << std::endl;
+    
+    // Submit IOs, handling partial submissions
+    size_t submitted = 0;
+    while (submitted < validPages.size()) {
+        int cnt = io_submit(ctx, validPages.size() - submitted, &cbPtr[submitted]);
+        if (cnt < 0) {
+            std::cerr << "io_submit failed: " << cnt << " errno: " << -cnt << std::endl;
+            std::cerr.flush();
+            abort();
+        }
+        if (cnt == 0) {
+            // No progress - this shouldn't happen
+            std::cerr << "io_submit returned 0, no progress possible" << std::endl;
+            abort();
+        }
+        submitted += cnt;
+    }
+    
+    int cnt = io_getevents(ctx, validPages.size(), validPages.size(), events, nullptr);
+    if (cnt != (int)validPages.size()) {
+        std::cerr << "io_getevents failed: " << cnt << " expected: " << validPages.size() << " errno: " << -cnt << std::endl;
         exit(EXIT_FAILURE);
     }
 }
@@ -1058,10 +1093,6 @@ PIDAllocator* BufferManager::getOrCreateAllocatorForIndex(u32 index_id, u64 max_
     if (hashMode == HashMode::Array2Level && pageState2Level) {
         if (!pageState2Level->isIndexRegistered(index_id)) {
             pageState2Level->registerIndex(index_id, max_pages, saved_alloc_count, index_fd);
-            std::cerr << "[BufferManager] Registered index " << index_id 
-                      << " in TwoLevelPageStateArray with max_pages=" << max_pages 
-                      << " initial_alloc=" << saved_alloc_count 
-                      << " fd=" << index_fd << std::endl;
         }
     }
     
@@ -1073,9 +1104,6 @@ PIDAllocator* BufferManager::getOrCreateAllocatorForIndex(u32 index_id, u64 max_
     
     PIDAllocator* ptr = allocator.get();
     perIndexAllocators[index_id] = std::move(allocator);
-    
-    std::cerr << "[BufferManager] Created allocator for index " << index_id 
-              << " starting at " << saved_alloc_count << std::endl;
     
     return ptr;
 }
@@ -1912,7 +1940,6 @@ void BufferManager::flushAll() {
                 u64 indexAllocCount = arr->allocCount.load(std::memory_order_acquire);
                 // Use min of allocCount and capacity to avoid overflow
                 u64 maxPages = std::min(indexAllocCount, arr->capacity);
-                cerr << "[flushAll] Flushing index " << indexId << " with " << maxPages << " pages (allocCount=" << indexAllocCount << ", capacity=" << arr->capacity << ")" << endl;
                 for (u64 localPid = 0; localPid < maxPages; ++localPid) {
                     // Encode global PID: (indexId << 32) | localPid
                     PID globalPid = (static_cast<u64>(indexId) << 32) | localPid;
@@ -1962,6 +1989,8 @@ void BufferManager::evict() {
 
     // 1. write dirty pages
     if (toWrite.size() > 0) {
+        std::cerr << "[evict] Writing " << toWrite.size() << " dirty pages" << std::endl;
+        std::cerr.flush();
         getIOInterface().writePages(toWrite);
         writeCount += toWrite.size();
     }

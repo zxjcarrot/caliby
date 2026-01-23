@@ -38,8 +38,13 @@ sudo dnf install -y gcc-c++ cmake libomp-devel abseil-cpp-devel python3-devel
 ```
 
 ### Installation
-Build from source:
 
+**From PyPI (Recommended):**
+```bash
+pip install caliby
+```
+
+**From Source:**
 ```bash
 git clone --recursive https://github.com/zxjcarrot/caliby.git
 cd caliby

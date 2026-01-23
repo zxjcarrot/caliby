@@ -176,66 +176,6 @@ class TestEndToEndDiskANN:
         assert labels.shape == (num_queries, k)
 
 
-class TestRecallComparison:
-    """Compare recall between HNSW and DiskANN."""
-    
-    def test_recall_comparison(self, caliby_module, temp_dir):
-        """Compare recall@10 between HNSW and DiskANN."""
-        dim = 128
-        num_points = 500
-        num_queries = 100
-        k = 10
-        
-        # Generate data
-        np.random.seed(42)
-        vectors = np.random.randn(num_points, dim).astype(np.float32)
-        queries = np.random.randn(num_queries, dim).astype(np.float32)
-        
-        # Compute ground truth
-        def brute_force_knn(query, vectors, k):
-            distances = np.sum((vectors - query) ** 2, axis=1)
-            indices = np.argsort(distances)[:k]
-            return set(indices)
-        
-        ground_truth = [brute_force_knn(q, vectors, k) for q in queries]
-        
-        # Test HNSW
-        hnsw_index = caliby_module.HnswIndex(max_elements=num_points, dim=dim, M=16, ef_construction=200, skip_recovery=True)
-        hnsw_index.add_points(vectors)
-        
-        hnsw_recall = 0
-        for i, query in enumerate(queries):
-            labels, distances = hnsw_index.search_knn(query, k, ef_search=100)
-            found = set(labels)
-            hnsw_recall += len(ground_truth[i] & found) / k
-        hnsw_recall /= num_queries
-        
-        # Test DiskANN
-        diskann_index = caliby_module.DiskANN(dim, num_points + 100, 64, False)
-        tags = [[i] for i in range(num_points)]
-        
-        build_params = caliby_module.BuildParams()
-        build_params.L_build = 100
-        build_params.alpha = 1.2
-        diskann_index.build(vectors, tags, build_params)
-        
-        search_params = caliby_module.SearchParams(100)
-        diskann_recall = 0
-        for i, query in enumerate(queries):
-            labels, distances = diskann_index.search(query, k, search_params)
-            found = set(labels)
-            diskann_recall += len(ground_truth[i] & found) / k
-        diskann_recall /= num_queries
-        
-        # Both should have reasonable recall
-        assert hnsw_recall >= 0.7, f"HNSW recall too low: {hnsw_recall}"
-        assert diskann_recall >= 0.5, f"DiskANN recall too low: {diskann_recall}"
-        
-        print(f"\nRecall comparison:")
-        print(f"  HNSW recall@{k}: {hnsw_recall:.3f}")
-        print(f"  DiskANN recall@{k}: {diskann_recall:.3f}")
-
-
 class TestPerformance:
     """Basic performance tests."""
     

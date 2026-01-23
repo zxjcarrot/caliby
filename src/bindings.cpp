@@ -102,7 +102,7 @@ using HnswIndexType = HNSW<hnsw_distance::SIMDAcceleratedL2>;
 // --- Python Module Definition ---
 PYBIND11_MODULE(caliby, m) {
     m.doc() = "Python bindings for the Calico Index(B-Tree, HNSW)";
-    m.attr("__version__") = "0.1.0.dev20260115013508";
+    m.attr("__version__") = "0.1.0.dev20260115021531";
     
     // Register cleanup function to be called at module unload
     auto cleanup = []() {

@@ -72,7 +72,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="caliby",
-    version="0.1.0",
+    version="0.1.1",
     author="Caliby Contributors",
     author_email="caliby@example.com",
     description="High-Performance Disk-Aware Vector Search Library",
