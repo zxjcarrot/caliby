@@ -2,7 +2,9 @@
 #define CALICO_HPP
 
 #include <libaio.h>
+#ifdef CALIBY_HAS_URING
 #include <liburing.h>
+#endif
 #include <nmmintrin.h>  // For CRC32 and prefetch
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -285,6 +287,7 @@ struct LibaioInterface: public IOInterface {
     virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations);
 };
 
+#ifdef CALIBY_HAS_URING
 struct IOUringInterface: public IOInterface {
     static const u64 maxIOs = 256;
     static const u64 queueDepth = 512;
@@ -298,6 +301,7 @@ struct IOUringInterface: public IOInterface {
     virtual void writePages(const std::vector<PID>& pages);
     virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations);
 };
+#endif
 
 struct FreePartition {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
