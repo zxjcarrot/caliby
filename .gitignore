@@ -89,4 +89,4 @@ output.txt
 
 # Analysis and test documentation
 analyze_vectors.py
-HOLE_PUNCHING_TESTS.md
+HOLE_PUNCHING_TESTS.md_codeql_detected_source_root
