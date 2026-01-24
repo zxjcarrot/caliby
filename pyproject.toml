@@ -7,8 +7,7 @@ name = "caliby"
 version = "0.1.1"
 description = "High-Performance Disk-Aware Vector Search Library"
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+license = { text = "MIT" }
 requires-python = ">=3.8"
 authors = [
     {name = "Caliby Contributors"}
@@ -56,6 +55,7 @@ Issues = "https://github.com/zxjcarrot/caliby/issues"
 
 [tool.setuptools]
 packages = []
+license-files = ["LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
