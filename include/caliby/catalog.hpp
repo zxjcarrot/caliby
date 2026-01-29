@@ -48,6 +48,103 @@ constexpr size_t MAX_FILE_PATH_LEN = 512;
 constexpr size_t TYPE_METADATA_SIZE = 256;
 
 //=============================================================================
+// Type-Specific Metadata Structures
+//=============================================================================
+
+/**
+ * HNSW-specific metadata stored in IndexEntry::type_metadata
+ */
+struct HnswTypeMetadata {
+    uint32_t M;              // Number of bidirectional links
+    uint32_t ef_construction; // Size of dynamic candidate list during construction
+    uint8_t reserved[248];   // Pad to TYPE_METADATA_SIZE
+    
+    void initialize(uint32_t m, uint32_t ef) {
+        M = m;
+        ef_construction = ef;
+        std::memset(reserved, 0, sizeof(reserved));
+    }
+};
+static_assert(sizeof(HnswTypeMetadata) == TYPE_METADATA_SIZE, "HnswTypeMetadata must match TYPE_METADATA_SIZE");
+
+/**
+ * Text index metadata stored in IndexEntry::type_metadata
+ */
+struct TextTypeMetadata {
+    static constexpr size_t MAX_ANALYZER_LEN = 32;
+    static constexpr size_t MAX_LANGUAGE_LEN = 32;
+    
+    char analyzer[MAX_ANALYZER_LEN];   // "standard", "whitespace", "none"
+    char language[MAX_LANGUAGE_LEN];   // For stemming/stopwords
+    float k1;                          // BM25 k1 parameter
+    float b;                           // BM25 b parameter
+    uint8_t reserved[256 - MAX_ANALYZER_LEN - MAX_LANGUAGE_LEN - 8];
+    
+    void initialize(const std::string& ana, const std::string& lang, float k1_val, float b_val) {
+        std::memset(this, 0, sizeof(*this));
+        std::strncpy(analyzer, ana.c_str(), MAX_ANALYZER_LEN - 1);
+        std::strncpy(language, lang.c_str(), MAX_LANGUAGE_LEN - 1);
+        k1 = k1_val;
+        b = b_val;
+    }
+};
+static_assert(sizeof(TextTypeMetadata) == TYPE_METADATA_SIZE, "TextTypeMetadata must match TYPE_METADATA_SIZE");
+
+/**
+ * Collection metadata stored in IndexEntry::type_metadata
+ * Stores the root PID of the ID B-tree index and other collection state.
+ */
+struct CollectionTypeMetadata {
+    uint64_t id_btree_root_pid;    // Root PID of the ID B-tree index (0 if not yet created)
+    uint32_t vector_dim;           // Vector dimensions (0 = no vectors)
+    uint32_t distance_metric;      // Distance metric enum value
+    uint64_t doc_count;            // Document count (for quick recovery)
+    uint64_t next_doc_id;          // Next document ID
+    uint8_t reserved[256 - 32];    // Reserved for future use
+    
+    void initialize(uint32_t vec_dim, uint32_t dist_metric) {
+        std::memset(this, 0, sizeof(*this));
+        id_btree_root_pid = 0;
+        vector_dim = vec_dim;
+        distance_metric = dist_metric;
+        doc_count = 0;
+        next_doc_id = 1;
+    }
+};
+static_assert(sizeof(CollectionTypeMetadata) == TYPE_METADATA_SIZE, "CollectionTypeMetadata must match TYPE_METADATA_SIZE");
+
+/**
+ * BTree/Metadata index metadata stored in IndexEntry::type_metadata
+ */
+struct BTreeTypeMetadata {
+    static constexpr size_t MAX_FIELD_LEN = 64;
+    static constexpr size_t MAX_FIELDS = 3;  // Support up to 3 fields in composite index
+    
+    char fields[MAX_FIELDS][MAX_FIELD_LEN];  // Field names
+    uint8_t num_fields;                       // Number of fields (1-3)
+    bool unique;                              // Unique constraint
+    uint8_t reserved[256 - (MAX_FIELDS * MAX_FIELD_LEN) - 2];
+    
+    void initialize(const std::vector<std::string>& field_list, bool is_unique) {
+        std::memset(this, 0, sizeof(*this));
+        num_fields = static_cast<uint8_t>(std::min(field_list.size(), static_cast<size_t>(MAX_FIELDS)));
+        for (size_t i = 0; i < num_fields; ++i) {
+            std::strncpy(fields[i], field_list[i].c_str(), MAX_FIELD_LEN - 1);
+        }
+        unique = is_unique;
+    }
+    
+    std::vector<std::string> get_fields() const {
+        std::vector<std::string> result;
+        for (size_t i = 0; i < num_fields; ++i) {
+            result.push_back(fields[i]);
+        }
+        return result;
+    }
+};
+static_assert(sizeof(BTreeTypeMetadata) == TYPE_METADATA_SIZE, "BTreeTypeMetadata must match TYPE_METADATA_SIZE");
+
+//=============================================================================
 // Enums
 //=============================================================================
 
@@ -55,7 +152,10 @@ enum class IndexType : uint32_t {
     CATALOG = 0,    // Reserved for catalog metadata
     HNSW = 1,       // HNSW index
     DISKANN = 2,    // DiskANN/Vamana index
-    IVF = 3,        // IVF index (future)
+    IVF = 3,        // IVF index
+    COLLECTION = 4, // Collection document storage
+    TEXT = 5,       // BM25 text index
+    BTREE = 6,      // B-tree metadata index
 };
 
 enum class IndexStatus : uint32_t {
@@ -134,6 +234,7 @@ struct IndexEntry {
     uint32_t dimensions;         // Vector dimensions
     uint64_t max_elements;       // Maximum capacity
     uint64_t num_elements;       // Current element count
+    uint64_t alloc_pages;        // Number of pages allocated (for recovery)
     uint64_t create_time;        // Creation timestamp (Unix epoch)
     uint64_t modify_time;        // Last modification timestamp
     char name[MAX_INDEX_NAME_LEN];       // Index name (null-terminated)
@@ -472,6 +573,32 @@ public:
                                       float alpha = 1.2f);
     
     /**
+     * Create a new Text index (BM25).
+     * @param name Unique index name
+     * @param analyzer Analyzer type ("standard", "whitespace", "none")
+     * @param language Language for stemming
+     * @param k1 BM25 k1 parameter
+     * @param b BM25 b parameter
+     * @return Handle to the new index
+     */
+    IndexHandle create_text_index(const std::string& name,
+                                   const std::string& analyzer = "standard",
+                                   const std::string& language = "english",
+                                   float k1 = 1.2f,
+                                   float b = 0.75f);
+    
+    /**
+     * Create a new BTree/Metadata index.
+     * @param name Unique index name
+     * @param fields Fields to index (up to 3 for composite)
+     * @param unique Whether to enforce uniqueness
+     * @return Handle to the new index
+     */
+    IndexHandle create_btree_index(const std::string& name,
+                                    const std::vector<std::string>& fields,
+                                    bool unique = false);
+    
+    /**
      * Open an existing index.
      * @param name Index name
      * @return Handle to the index
@@ -501,6 +628,31 @@ public:
      */
     IndexInfo get_index_info(const std::string& name) const;
     
+    /**
+     * Get HNSW config for an index (only valid for HNSW type indices).
+     */
+    HNSWConfig get_hnsw_config(const std::string& name) const;
+    
+    /**
+     * Get Text index config (only valid for TEXT type indices).
+     */
+    TextTypeMetadata get_text_config(const std::string& name) const;
+    
+    /**
+     * Get BTree index config (only valid for BTREE type indices).
+     */
+    BTreeTypeMetadata get_btree_config(const std::string& name) const;
+    
+    /**
+     * Get Collection metadata (only valid for COLLECTION type indices).
+     */
+    CollectionTypeMetadata get_collection_config(const std::string& name) const;
+    
+    /**
+     * Update Collection metadata (e.g., ID B-tree root PID, doc count).
+     */
+    void update_collection_config(const std::string& name, const CollectionTypeMetadata& config);
+
     //-------------------------------------------------------------------------
     // Internal Access (for IndexHandle)
     //-------------------------------------------------------------------------
@@ -526,6 +678,17 @@ public:
      * Update element count for an index.
      */
     void update_index_element_count(uint32_t index_id, uint64_t count);
+    
+    /**
+     * Update allocated pages count for an index.
+     * This should be called before shutdown to persist the current allocation size.
+     */
+    void update_index_alloc_pages(uint32_t index_id, uint64_t alloc_pages);
+    
+    /**
+     * Get the allocated pages count for an index.
+     */
+    uint64_t get_index_alloc_pages(uint32_t index_id) const;
     
     /**
      * Get the data directory.

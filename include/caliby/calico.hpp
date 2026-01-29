@@ -325,12 +325,15 @@ struct IndexTranslationArray {
     static constexpr u64 ENTRIES_PER_OS_PAGE = TRANSLATION_OS_PAGE_SIZE / sizeof(PageState);
     static constexpr u32 REF_COUNT_LOCK_BIT = 0x80000000u;
     static constexpr u32 REF_COUNT_MASK = 0x7FFFFFFFu;
+    static constexpr u64 GROWTH_FACTOR = 2;  // Double capacity when growing
+    static constexpr u64 MIN_INITIAL_CAPACITY = 1024;  // Minimum initial pages
     
     PageState* pageStates;              // Page state array for this index (mmap'd)
-    u64 capacity;                        // Allocated capacity (number of PageState entries)
+    std::atomic<u64> capacity;          // Allocated capacity (number of PageState entries) - atomic for lock-free reads
     std::atomic<u32>* refCounts;        // Reference counts per OS page group
     u64 numRefCountGroups;              // Number of ref count groups
     std::atomic<u64> allocCount;        // Per-index allocation counter for local PIDs
+    mutable std::mutex growMutex;       // Mutex for thread-safe growth
     
     // Cached information for translation path caching
     int file_fd;                         // File descriptor for this index's data file
@@ -346,6 +349,15 @@ struct IndexTranslationArray {
     inline PageState& get(u64 localPageId) {
         return pageStates[localPageId];
     }
+    
+    /**
+     * Grow the translation array to accommodate at least minCapacity pages.
+     * Uses mremap() for efficient in-place growth on Linux.
+     * Thread-safe: multiple threads can call this concurrently.
+     * @param minCapacity Minimum required capacity
+     * @return true if growth succeeded or capacity already sufficient, false on failure
+     */
+    bool ensureCapacity(u64 minCapacity);
     
     // Hole punching support - increment ref count when page becomes resident
     void incrementRefCount(u64 localPageId);
@@ -502,6 +514,18 @@ struct TwoLevelPageStateArray {
     // Hole punching support - delegates to per-index array
     void incrementRefCount(PID pid);
     void decrementRefCount(PID pid);
+    
+    /**
+     * Get the current capacity (in pages) of an index's translation array.
+     * Returns 0 if index is not registered.
+     */
+    u64 getIndexCapacity(u32 indexId) const;
+    
+    /**
+     * Get all registered index IDs with their capacities.
+     * Used for persisting allocation state on shutdown.
+     */
+    std::vector<std::pair<u32, u64>> getAllIndexCapacities() const;
 };
 
 // Three-level indirection for PageState array
@@ -754,9 +778,10 @@ struct BufferManager {
      * Register a new index with the buffer manager.
      * @param indexId The index ID (0-65535)
      * @param maxPages Maximum number of pages for this index
+     * @param initialAllocCount Initial allocation count from catalog recovery (default: 0)
      * @param fileFd File descriptor for this index's data file (optional, for caching)
      */
-    void registerIndex(u32 indexId, u64 maxPages, int fileFd = -1) {
+    void registerIndex(u32 indexId, u64 maxPages, u64 initialAllocCount = 0, int fileFd = -1) {
         // Register with simple IndexCatalog (for fd tracking)
         if (indexCatalog) {
             indexCatalog->registerIndex(indexId, maxPages, fileFd);
@@ -767,7 +792,7 @@ struct BufferManager {
             // The single translation array handles all PIDs
             return;
         }
-        pageState2Level->registerIndex(indexId, maxPages, 0, fileFd);  // 0 = initialAllocCount
+        pageState2Level->registerIndex(indexId, maxPages, initialAllocCount, fileFd);
     }
     
     /**
@@ -860,10 +885,18 @@ struct BufferManager {
     static u32 getLocalPageIdFromPID(PID pid) {
         return TwoLevelPageStateArray::getLocalPageId(pid);
     }
+    
+    /**
+     * Persist all index translation array capacities to the catalog.
+     * Called before shutdown to ensure proper recovery on restart.
+     */
+    void persistIndexCapacities();
 };
 typedef u64 KeyType;
 
 extern BufferManager* bm_ptr;
+// Flag to track if the system has been closed (index arrays unregistered)
+extern bool system_closed;
 // Define a convenience reference to avoid changing all code that uses bm
 #define bm (*bm_ptr)
 
@@ -1324,6 +1357,7 @@ struct AllocGuard : public GuardX<T> {
         GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPageForIndex(indexId, allocator));
         new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
         GuardX<T>::pid = bm.toPID(GuardX<T>::ptr);
+        GuardX<T>::ptr->dirty = true;  // Mark newly allocated page as dirty
     }
 
     // Default constructor (no allocator, no parameters) - uses index 0
@@ -1331,6 +1365,7 @@ struct AllocGuard : public GuardX<T> {
         GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPage(nullptr));
         new (GuardX<T>::ptr) T();
         GuardX<T>::pid = bm.toPID(GuardX<T>::ptr);
+        GuardX<T>::ptr->dirty = true;  // Mark newly allocated page as dirty
     }
 };
 
@@ -1630,8 +1665,12 @@ struct BTree {
     std::atomic<bool> splitOrdered;
     PIDAllocator pidAllocator;
 
-    BTree();
+    BTree();                              // Create new BTree with new slotId
+    explicit BTree(unsigned existingSlotId); // Recover existing BTree from slotId
     ~BTree();
+    
+    // Get the slot ID for persistence
+    unsigned getSlotId() const { return slotId; }
 
     GuardO<BTreeNode> findLeafO(std::span<u8> key);
     GuardS<BTreeNode> findLeafS(std::span<u8> key);

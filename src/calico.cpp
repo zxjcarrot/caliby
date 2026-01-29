@@ -1,4 +1,5 @@
 #include "calico.hpp"
+#include "catalog.hpp"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -45,6 +46,9 @@ using namespace tpcc;
 
 // Definition for global BufferManager instance
 BufferManager* bm_ptr = nullptr;
+
+// Flag to track if the system has been closed (index arrays unregistered)
+bool system_closed = false;
 
 // Definition for PageState static member
 bool PageState::packedMode = false;
@@ -214,8 +218,12 @@ IndexTranslationArray::IndexTranslationArray(u32 indexId, u64 maxPages, u64 init
     : capacity(maxPages), file_fd(fd), index_id(indexId), 
       allocCount(indexId == 0 ? initialAllocCount : (initialAllocCount == 0 ? 1 : initialAllocCount)) {
     
+    // Ensure minimum initial capacity
+    u64 initialCapacity = std::max(maxPages, MIN_INITIAL_CAPACITY);
+    capacity.store(initialCapacity, std::memory_order_relaxed);
+    
     // Allocate page state array using mmap (NOT huge pages for fine-grained hole punching)
-    size_t arraySize = maxPages * sizeof(PageState);
+    size_t arraySize = initialCapacity * sizeof(PageState);
     pageStates = (PageState*)mmap(nullptr, arraySize, 
                                    PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -229,16 +237,69 @@ IndexTranslationArray::IndexTranslationArray(u32 indexId, u64 maxPages, u64 init
     // Allocate reference counts array
     refCounts = new std::atomic<u32>[numRefCountGroups]();
     
-    // // Initialize all page states - NOT NEEDED, zero-filled memory from mmap
-    // // represents valid Evicted state which is correct initial state
-    // for (u64 i = 0; i < maxPages; i++) {
-    //     pageStates[i].init();
-    // }
-    
     std::cerr << "[IndexTranslationArray] Created for index " << indexId
-              << " with capacity=" << maxPages << " pages"
+              << " with initial capacity=" << initialCapacity << " pages (growable)"
               << " (" << numRefCountGroups << " ref count groups)"
               << std::endl;
+}
+
+bool IndexTranslationArray::ensureCapacity(u64 minCapacity) {
+    // Fast path: check if capacity is already sufficient (lock-free read)
+    u64 currentCapacity = capacity.load(std::memory_order_acquire);
+    if (currentCapacity >= minCapacity) {
+        return true;
+    }
+    
+    // Slow path: need to grow - acquire lock
+    std::lock_guard<std::mutex> lock(growMutex);
+    
+    // Double-check after acquiring lock (another thread may have grown)
+    currentCapacity = capacity.load(std::memory_order_acquire);
+    if (currentCapacity >= minCapacity) {
+        return true;
+    }
+    
+    // Calculate new capacity (at least double, or enough for minCapacity)
+    u64 newCapacity = currentCapacity;
+    while (newCapacity < minCapacity) {
+        newCapacity *= GROWTH_FACTOR;
+    }
+    
+    // Use mremap to grow the array in-place (Linux-specific, very efficient)
+    size_t oldSize = currentCapacity * sizeof(PageState);
+    size_t newSize = newCapacity * sizeof(PageState);
+    
+    void* newPageStates = mremap(pageStates, oldSize, newSize, MREMAP_MAYMOVE);
+    if (newPageStates == MAP_FAILED) {
+        std::cerr << "[IndexTranslationArray] mremap failed for index " << index_id
+                  << " trying to grow from " << currentCapacity << " to " << newCapacity
+                  << " pages, errno: " << errno << std::endl;
+        return false;
+    }
+    
+    pageStates = (PageState*)newPageStates;
+    
+    // Grow reference counts array
+    u64 newNumRefCountGroups = (newSize + TRANSLATION_OS_PAGE_SIZE - 1) / TRANSLATION_OS_PAGE_SIZE;
+    if (newNumRefCountGroups > numRefCountGroups) {
+        std::atomic<u32>* newRefCounts = new std::atomic<u32>[newNumRefCountGroups]();
+        // Copy old ref counts
+        for (u64 i = 0; i < numRefCountGroups; i++) {
+            newRefCounts[i].store(refCounts[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        delete[] refCounts;
+        refCounts = newRefCounts;
+        numRefCountGroups = newNumRefCountGroups;
+    }
+    
+    // Update capacity (atomic store with release semantics so other threads see new capacity)
+    capacity.store(newCapacity, std::memory_order_release);
+    
+    std::cerr << "[IndexTranslationArray] Grew index " << index_id
+              << " from " << currentCapacity << " to " << newCapacity << " pages"
+              << std::endl;
+    
+    return true;
 }
 
 IndexTranslationArray::~IndexTranslationArray() {
@@ -258,7 +319,7 @@ IndexTranslationArray::~IndexTranslationArray() {
     // }
     
     if (pageStates != nullptr && pageStates != MAP_FAILED) {
-        size_t arraySize = capacity * sizeof(PageState);
+        size_t arraySize = capacity.load(std::memory_order_relaxed) * sizeof(PageState);
         munmap(pageStates, arraySize);
     }
     delete[] refCounts;
@@ -496,6 +557,32 @@ void TwoLevelPageStateArray::decrementRefCount(PID pid) {
         arr->decrementRefCount(localPageId, *holePunchCounterPtr);
     } else {
         }
+}
+
+u64 TwoLevelPageStateArray::getIndexCapacity(u32 indexId) const {
+    if (indexId >= numIndexSlots) {
+        return 0;
+    }
+    std::shared_lock<std::shared_mutex> lock(indexMutex);
+    IndexTranslationArray* arr = indexArrays[indexId].load(std::memory_order_acquire);
+    if (arr == nullptr) {
+        return 0;
+    }
+    return arr->capacity.load(std::memory_order_relaxed);
+}
+
+std::vector<std::pair<u32, u64>> TwoLevelPageStateArray::getAllIndexCapacities() const {
+    std::vector<std::pair<u32, u64>> result;
+    std::shared_lock<std::shared_mutex> lock(indexMutex);
+    
+    for (u32 i = 0; i < numIndexSlots; ++i) {
+        IndexTranslationArray* arr = indexArrays[i].load(std::memory_order_acquire);
+        if (arr != nullptr) {
+            u64 cap = arr->capacity.load(std::memory_order_relaxed);
+            result.emplace_back(i, cap);
+        }
+    }
+    return result;
 }
 
 // ThreeLevelPageStateArray implementation
@@ -1637,10 +1724,13 @@ Page* BufferManager::allocPageForIndex(u32 indexId, PIDAllocator* allocator) {
         localPid = indexArray->allocCount++;
     }
     
-    // Check capacity
-    if (localPid >= indexArray->capacity) {
-        cerr << "Index " << indexId << " exceeded capacity " << indexArray->capacity << endl;
-        exit(EXIT_FAILURE);
+    // Ensure capacity - grow array if needed (truly unbounded growth)
+    if (localPid >= indexArray->capacity.load(std::memory_order_acquire)) {
+        // Need more capacity - grow the array
+        if (!indexArray->ensureCapacity(localPid + 1)) {
+            cerr << "Index " << indexId << " failed to grow capacity for page " << localPid << endl;
+            exit(EXIT_FAILURE);  // Only fail if mremap fails (out of virtual address space)
+        }
     }
     
     // Encode as global PID: [index_id (32 bits)][local_page_id (32 bits)]
@@ -1938,8 +2028,9 @@ void BufferManager::flushAll() {
             IndexTranslationArray* arr = pageState2Level->getIndexArray(indexId);
             if (arr) {
                 u64 indexAllocCount = arr->allocCount.load(std::memory_order_acquire);
+                u64 indexCapacity = arr->capacity.load(std::memory_order_acquire);
                 // Use min of allocCount and capacity to avoid overflow
-                u64 maxPages = std::min(indexAllocCount, arr->capacity);
+                u64 maxPages = std::min(indexAllocCount, indexCapacity);
                 for (u64 localPid = 0; localPid < maxPages; ++localPid) {
                     // Encode global PID: (indexId << 32) | localPid
                     PID globalPid = (static_cast<u64>(indexId) << 32) | localPid;
@@ -1957,6 +2048,30 @@ void BufferManager::flushAll() {
 
     flush_batch();
     cerr << "BufferManager flushed " << flushed_pages << " pages." << endl;
+}
+
+void BufferManager::persistIndexCapacities() {
+    // Save all index translation array capacities to the IndexCatalog
+    // This ensures proper recovery of array sizes on restart
+    
+    if (hashMode != HashMode::Array2Level || !pageState2Level) {
+        return;
+    }
+    
+    auto& catalog = caliby::IndexCatalog::instance();
+    if (!catalog.is_initialized()) {
+        return;
+    }
+    
+    auto capacities = pageState2Level->getAllIndexCapacities();
+    for (const auto& [indexId, capacity] : capacities) {
+        // Skip index 0 (default array) if not explicitly created
+        if (indexId == 0) continue;
+        
+        catalog.update_index_alloc_pages(indexId, capacity);
+    }
+    
+    std::cerr << "[BufferManager] Persisted capacities for " << capacities.size() << " indexes" << std::endl;
 }
 
 void BufferManager::evict() {
@@ -1989,8 +2104,6 @@ void BufferManager::evict() {
 
     // 1. write dirty pages
     if (toWrite.size() > 0) {
-        std::cerr << "[evict] Writing " << toWrite.size() << " dirty pages" << std::endl;
-        std::cerr.flush();
         getIOInterface().writePages(toWrite);
         writeCount += toWrite.size();
     }
@@ -2661,6 +2774,23 @@ BTree::BTree() : splitOrdered(false) {
         slotId = btreeslotcounter++;
         page->roots[slotId] = rootNodePid;
         page->dirty = true;
+    }
+}
+
+// Recovery constructor: reuse existing slotId to recover a persisted BTree
+BTree::BTree(unsigned existingSlotId) : slotId(existingSlotId), splitOrdered(false) {
+    // Ensure btreeslotcounter stays ahead of recovered slots
+    if (existingSlotId >= btreeslotcounter) {
+        btreeslotcounter = existingSlotId + 1;
+    }
+    
+    // Verify the slot has a valid root PID in the metadata page
+    {
+        GuardO<MetaDataPage> meta(metadataPageId);
+        PID rootPid = meta->getRoot(slotId);
+        if (rootPid == 0) {
+            throw std::runtime_error("BTree recovery failed: invalid root PID for slotId " + std::to_string(slotId));
+        }
     }
 }
 

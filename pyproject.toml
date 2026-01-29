@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "caliby"
-version = "0.1.1"
+version = "0.1.0.dev20260129183920"
 description = "High-Performance Disk-Aware Vector Search Library"
 readme = "README.md"
 license = { file = "LICENSE" }

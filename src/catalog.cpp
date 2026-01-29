@@ -171,10 +171,13 @@ void MultiFileStorage::write_page(uint32_t index_id, uint64_t local_page_id, con
 std::string MultiFileStorage::make_index_filename(IndexType type, uint32_t index_id, const std::string& index_name) const {
     std::string type_str;
     switch (type) {
-        case IndexType::HNSW:    type_str = "hnsw"; break;
-        case IndexType::DISKANN: type_str = "diskann"; break;
-        case IndexType::IVF:     type_str = "ivf"; break;
-        default:                 type_str = "unknown"; break;
+        case IndexType::HNSW:       type_str = "hnsw"; break;
+        case IndexType::DISKANN:    type_str = "diskann"; break;
+        case IndexType::IVF:        type_str = "ivf"; break;
+        case IndexType::COLLECTION: type_str = "collection"; break;
+        case IndexType::TEXT:       type_str = "text"; break;
+        case IndexType::BTREE:      type_str = "btree"; break;
+        default:                    type_str = "unknown"; break;
     }
     return "caliby_" + type_str + "_" + std::to_string(index_id) + "_" + index_name + ".dat";
 }
@@ -342,9 +345,19 @@ void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist
                         // Open the file to get fd
                         int fd = storage_.open_file(entry.index_id, entry.file_path, false);
                         
-                        // Re-register with buffer manager
-                        uint64_t estimated_pages = (entry.max_elements / 2) + 1024;
-                        buffer_manager_->registerIndex(entry.index_id, estimated_pages, fd);
+                        // Use stored alloc_pages if available, otherwise estimate
+                        uint64_t initial_pages;
+                        uint64_t initial_alloc_count = 0;
+                        if (entry.alloc_pages > 0) {
+                            // Use the actual allocated pages from last run
+                            initial_pages = entry.alloc_pages;
+                            initial_alloc_count = entry.alloc_pages;  // Also restore allocCount
+                        } else if (entry.max_elements == 0) {
+                            initial_pages = 1024;  // Unbounded - start small, grows automatically
+                        } else {
+                            initial_pages = (entry.max_elements / 2) + 1024;
+                        }
+                        buffer_manager_->registerIndex(entry.index_id, initial_pages, initial_alloc_count, fd);
                         recovered++;
                         
                         std::cerr << "[IndexCatalog] Recovered index: " << entry.name 
@@ -580,11 +593,18 @@ IndexHandle IndexCatalog::create_index(const std::string& name, IndexType type,
     // Register index with BufferManager's multi-level translation array
     // This allocates a per-index translation array for hole-punching
     if (buffer_manager_) {
-        // Calculate max pages for this index based on max_elements
-        // Estimate: each element needs ~1KB for vector data + metadata
-        // With 4KB pages, that's ~4 elements per page + overhead for graph structure
-        uint64_t estimated_pages = (config.max_elements / 2) + 1024;  // Conservative estimate
-        buffer_manager_->registerIndex(index_id, estimated_pages, fd);
+        // Initial capacity - array will grow dynamically as needed via mremap()
+        // Start with a small capacity; ensureCapacity() will grow it automatically
+        // This means collections can truly grow unbounded (limited only by virtual address space)
+        uint64_t initial_pages;
+        if (config.max_elements == 0) {
+            // Unbounded collection - start small, will grow via mremap()
+            initial_pages = 1024;  // ~4MB initial, grows automatically
+        } else {
+            // Fixed max_elements - estimate based on that
+            initial_pages = (config.max_elements / 2) + 1024;
+        }
+        buffer_manager_->registerIndex(index_id, initial_pages, 0, fd);  // 0 = initial alloc count
     }
     
     // Add to catalog
@@ -635,6 +655,162 @@ IndexHandle IndexCatalog::create_diskann_index(const std::string& name,
     config.diskann.alpha = alpha;
     
     return create_index(name, IndexType::DISKANN, config);
+}
+
+IndexHandle IndexCatalog::create_text_index(const std::string& name,
+                                             const std::string& analyzer,
+                                             const std::string& language,
+                                             float k1,
+                                             float b) {
+    std::unique_lock lock(catalog_mutex_);
+    
+    if (!initialized_.load()) {
+        throw std::runtime_error("Catalog not initialized");
+    }
+    
+    // Check name doesn't exist
+    if (name_to_index_id_.find(name) != name_to_index_id_.end()) {
+        throw std::runtime_error("Index already exists: " + name);
+    }
+    
+    // Validate name
+    if (name.empty() || name.length() >= MAX_INDEX_NAME_LEN) {
+        throw std::runtime_error("Invalid index name length");
+    }
+    
+    // Allocate index ID
+    uint32_t index_id = allocate_index_id();
+    
+    // Create index entry
+    IndexEntry entry;
+    entry.clear();
+    entry.index_id = index_id;
+    entry.index_type = IndexType::TEXT;
+    entry.status = IndexStatus::CREATING;
+    entry.dimensions = 0;
+    entry.max_elements = 0;
+    entry.num_elements = 0;
+    entry.create_time = static_cast<uint64_t>(std::time(nullptr));
+    entry.modify_time = entry.create_time;
+    std::strncpy(entry.name, name.c_str(), MAX_INDEX_NAME_LEN - 1);
+    
+    // Create index file
+    std::string filename = storage_.make_index_filename(IndexType::TEXT, index_id, name);
+    std::strncpy(entry.file_path, filename.c_str(), MAX_FILE_PATH_LEN - 1);
+    
+    // Store text-specific metadata
+    TextTypeMetadata text_meta;
+    text_meta.initialize(analyzer, language, k1, b);
+    std::memcpy(entry.type_metadata, &text_meta, sizeof(TextTypeMetadata));
+    
+    // Open the index file (creates it)
+    int fd = storage_.open_file(index_id, filename, true);
+    if (fd < 0) {
+        throw std::runtime_error("Failed to create index file: " + filename);
+    }
+    
+    // Register index with BufferManager
+    if (buffer_manager_) {
+        uint64_t initial_pages = 1024;  // Start small, grows automatically
+        buffer_manager_->registerIndex(index_id, initial_pages, 0, fd);  // 0 = initial alloc count
+    }
+    
+    // Add to catalog
+    entries_.push_back(entry);
+    name_to_index_id_[name] = index_id;
+    header_.num_indexes++;
+    
+    // Mark as active
+    entries_.back().status = IndexStatus::ACTIVE;
+    
+    // Persist catalog changes
+    save_catalog_header();
+    save_index_entry(entries_.back());
+    
+    std::cout << "[IndexCatalog] Created index: " << name 
+              << " (id=" << index_id << ", type=TEXT)" << std::endl;
+    
+    return IndexHandle(this, index_id, fd, name, IndexType::TEXT, 0, 0);
+}
+
+IndexHandle IndexCatalog::create_btree_index(const std::string& name,
+                                              const std::vector<std::string>& fields,
+                                              bool unique) {
+    std::unique_lock lock(catalog_mutex_);
+    
+    if (!initialized_.load()) {
+        throw std::runtime_error("Catalog not initialized");
+    }
+    
+    // Check name doesn't exist
+    if (name_to_index_id_.find(name) != name_to_index_id_.end()) {
+        throw std::runtime_error("Index already exists: " + name);
+    }
+    
+    // Validate name
+    if (name.empty() || name.length() >= MAX_INDEX_NAME_LEN) {
+        throw std::runtime_error("Invalid index name length");
+    }
+    
+    // Validate fields
+    if (fields.empty() || fields.size() > BTreeTypeMetadata::MAX_FIELDS) {
+        throw std::runtime_error("BTree index requires 1-" + 
+                                std::to_string(BTreeTypeMetadata::MAX_FIELDS) + " fields");
+    }
+    
+    // Allocate index ID
+    uint32_t index_id = allocate_index_id();
+    
+    // Create index entry
+    IndexEntry entry;
+    entry.clear();
+    entry.index_id = index_id;
+    entry.index_type = IndexType::BTREE;
+    entry.status = IndexStatus::CREATING;
+    entry.dimensions = 0;
+    entry.max_elements = 0;
+    entry.num_elements = 0;
+    entry.create_time = static_cast<uint64_t>(std::time(nullptr));
+    entry.modify_time = entry.create_time;
+    std::strncpy(entry.name, name.c_str(), MAX_INDEX_NAME_LEN - 1);
+    
+    // Create index file
+    std::string filename = storage_.make_index_filename(IndexType::BTREE, index_id, name);
+    std::strncpy(entry.file_path, filename.c_str(), MAX_FILE_PATH_LEN - 1);
+    
+    // Store btree-specific metadata
+    BTreeTypeMetadata btree_meta;
+    btree_meta.initialize(fields, unique);
+    std::memcpy(entry.type_metadata, &btree_meta, sizeof(BTreeTypeMetadata));
+    
+    // Open the index file (creates it)
+    int fd = storage_.open_file(index_id, filename, true);
+    if (fd < 0) {
+        throw std::runtime_error("Failed to create index file: " + filename);
+    }
+    
+    // Register index with BufferManager
+    if (buffer_manager_) {
+        uint64_t initial_pages = 1024;  // Start small, grows automatically
+        buffer_manager_->registerIndex(index_id, initial_pages, 0, fd);  // 0 = initial alloc count
+    }
+    
+    // Add to catalog
+    entries_.push_back(entry);
+    name_to_index_id_[name] = index_id;
+    header_.num_indexes++;
+    
+    // Mark as active
+    entries_.back().status = IndexStatus::ACTIVE;
+    
+    // Persist catalog changes
+    save_catalog_header();
+    save_index_entry(entries_.back());
+    
+    std::cout << "[IndexCatalog] Created index: " << name 
+              << " (id=" << index_id << ", type=BTREE)" << std::endl;
+    
+    return IndexHandle(this, index_id, fd, name, IndexType::BTREE, 0, 0);
 }
 
 IndexHandle IndexCatalog::open_index(const std::string& name) {
@@ -790,6 +966,151 @@ IndexInfo IndexCatalog::get_index_info(const std::string& name) const {
     return info;
 }
 
+HNSWConfig IndexCatalog::get_hnsw_config(const std::string& name) const {
+    std::shared_lock lock(catalog_mutex_);
+    
+    auto it = name_to_index_id_.find(name);
+    if (it == name_to_index_id_.end()) {
+        throw std::runtime_error("Index not found: " + name);
+    }
+    
+    const IndexEntry* entry = nullptr;
+    for (const auto& e : entries_) {
+        if (e.index_id == it->second) {
+            entry = &e;
+            break;
+        }
+    }
+    
+    if (!entry) {
+        throw std::runtime_error("Index entry not found: " + name);
+    }
+    
+    if (entry->index_type != IndexType::HNSW) {
+        throw std::runtime_error("Index is not HNSW type: " + name);
+    }
+    
+    HNSWConfig config;
+    std::memcpy(&config, entry->type_metadata, sizeof(HNSWConfig));
+    return config;
+}
+
+TextTypeMetadata IndexCatalog::get_text_config(const std::string& name) const {
+    std::shared_lock lock(catalog_mutex_);
+    
+    auto it = name_to_index_id_.find(name);
+    if (it == name_to_index_id_.end()) {
+        throw std::runtime_error("Index not found: " + name);
+    }
+    
+    const IndexEntry* entry = nullptr;
+    for (const auto& e : entries_) {
+        if (e.index_id == it->second) {
+            entry = &e;
+            break;
+        }
+    }
+    
+    if (!entry) {
+        throw std::runtime_error("Index entry not found: " + name);
+    }
+    
+    if (entry->index_type != IndexType::TEXT) {
+        throw std::runtime_error("Index is not TEXT type: " + name);
+    }
+    
+    TextTypeMetadata config;
+    std::memcpy(&config, entry->type_metadata, sizeof(TextTypeMetadata));
+    return config;
+}
+
+BTreeTypeMetadata IndexCatalog::get_btree_config(const std::string& name) const {
+    std::shared_lock lock(catalog_mutex_);
+    
+    auto it = name_to_index_id_.find(name);
+    if (it == name_to_index_id_.end()) {
+        throw std::runtime_error("Index not found: " + name);
+    }
+    
+    const IndexEntry* entry = nullptr;
+    for (const auto& e : entries_) {
+        if (e.index_id == it->second) {
+            entry = &e;
+            break;
+        }
+    }
+    
+    if (!entry) {
+        throw std::runtime_error("Index entry not found: " + name);
+    }
+    
+    if (entry->index_type != IndexType::BTREE) {
+        throw std::runtime_error("Index is not BTREE type: " + name);
+    }
+    
+    BTreeTypeMetadata config;
+    std::memcpy(&config, entry->type_metadata, sizeof(BTreeTypeMetadata));
+    return config;
+}
+
+CollectionTypeMetadata IndexCatalog::get_collection_config(const std::string& name) const {
+    std::shared_lock lock(catalog_mutex_);
+    
+    auto it = name_to_index_id_.find(name);
+    if (it == name_to_index_id_.end()) {
+        throw std::runtime_error("Collection not found: " + name);
+    }
+    
+    const IndexEntry* entry = nullptr;
+    for (const auto& e : entries_) {
+        if (e.index_id == it->second) {
+            entry = &e;
+            break;
+        }
+    }
+    
+    if (!entry) {
+        throw std::runtime_error("Collection entry not found: " + name);
+    }
+    
+    if (entry->index_type != IndexType::COLLECTION) {
+        throw std::runtime_error("Entry is not COLLECTION type: " + name);
+    }
+    
+    CollectionTypeMetadata config;
+    std::memcpy(&config, entry->type_metadata, sizeof(CollectionTypeMetadata));
+    return config;
+}
+
+void IndexCatalog::update_collection_config(const std::string& name, const CollectionTypeMetadata& config) {
+    std::unique_lock lock(catalog_mutex_);
+    
+    auto it = name_to_index_id_.find(name);
+    if (it == name_to_index_id_.end()) {
+        throw std::runtime_error("Collection not found: " + name);
+    }
+    
+    IndexEntry* entry = nullptr;
+    for (auto& e : entries_) {
+        if (e.index_id == it->second) {
+            entry = &e;
+            break;
+        }
+    }
+    
+    if (!entry) {
+        throw std::runtime_error("Collection entry not found: " + name);
+    }
+    
+    if (entry->index_type != IndexType::COLLECTION) {
+        throw std::runtime_error("Entry is not COLLECTION type: " + name);
+    }
+    
+    std::memcpy(entry->type_metadata, &config, sizeof(CollectionTypeMetadata));
+    entry->modify_time = static_cast<uint64_t>(std::time(nullptr));
+    save_index_entry(*entry);
+}
+
 void IndexCatalog::update_index_element_count(uint32_t index_id, uint64_t count) {
     std::unique_lock lock(catalog_mutex_);
     
@@ -799,6 +1120,31 @@ void IndexCatalog::update_index_element_count(uint32_t index_id, uint64_t count)
         entry->modify_time = static_cast<uint64_t>(std::time(nullptr));
         save_index_entry(*entry);
     }
+}
+
+void IndexCatalog::update_index_alloc_pages(uint32_t index_id, uint64_t alloc_pages) {
+    std::unique_lock lock(catalog_mutex_);
+    
+    IndexEntry* entry = find_entry_by_id(index_id);
+    if (entry) {
+        entry->alloc_pages = alloc_pages;
+        entry->modify_time = static_cast<uint64_t>(std::time(nullptr));
+        save_index_entry(*entry);
+        
+        std::cerr << "[IndexCatalog] Updated alloc_pages for index " << index_id 
+                  << " to " << alloc_pages << std::endl;
+    }
+}
+
+uint64_t IndexCatalog::get_index_alloc_pages(uint32_t index_id) const {
+    std::shared_lock lock(catalog_mutex_);
+    
+    // Need to cast away const for find_entry_by_id (which doesn't modify but isn't marked const)
+    IndexEntry* entry = const_cast<IndexCatalog*>(this)->find_entry_by_id(index_id);
+    if (entry) {
+        return entry->alloc_pages;
+    }
+    return 0;
 }
 
 } // namespace caliby

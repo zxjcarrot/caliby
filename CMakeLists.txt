@@ -70,6 +70,9 @@ set(CALIBY_SOURCES
     src/distance_diskann.cpp
     src/catalog.cpp
     src/ivfpq.cpp
+    src/collection.cpp
+    src/text_index.cpp
+    src/btree_index.cpp
 )
 
 # Create static library

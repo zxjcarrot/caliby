@@ -11,10 +11,12 @@
 
 #include "calico.hpp"
 #include "catalog.hpp"
+#include "collection.hpp"
 #include "diskann.hpp"
 #include "distance.hpp"
 #include "hnsw.hpp"
 #include "ivfpq.hpp"
+#include "text_index.hpp"
 
 #if defined(_WIN32)
 #include <psapi.h>
@@ -102,7 +104,7 @@ using HnswIndexType = HNSW<hnsw_distance::SIMDAcceleratedL2>;
 // --- Python Module Definition ---
 PYBIND11_MODULE(caliby, m) {
     m.doc() = "Python bindings for the Calico Index(B-Tree, HNSW)";
-    m.attr("__version__") = "0.1.0.dev20260115021531";
+    m.attr("__version__") = "0.1.0.dev20260129183920";
     
     // Register cleanup function to be called at module unload
     auto cleanup = []() {
@@ -133,6 +135,9 @@ PYBIND11_MODULE(caliby, m) {
           "Flushes all dirty pages managed by the Calico buffer pool to persistent storage.");
     
     m.def("open", [](const std::string& data_dir, bool cleanup_if_exist) {
+        // Reset system closed flag - system is being (re)opened
+        system_closed = false;
+        
         // Initialize the buffer manager and catalog with the specified directory
         initialize_system();
         
@@ -156,8 +161,20 @@ PYBIND11_MODULE(caliby, m) {
     "  cleanup_if_exist: If True, removes all existing indexes and data in the directory (default: False)");
     
     m.def("close", []() {
-        // Flush all changes and shutdown catalog
+        // Mark system as closed BEFORE unregistering index arrays
+        // This prevents Collection destructors from trying to flush after close
+        system_closed = true;
+        
+        // Flush all changes
         flush_system();
+        
+        // Persist index translation array capacities before shutdown
+        // This ensures proper recovery of array sizes on restart
+        if (bm_ptr != nullptr) {
+            bm_ptr->persistIndexCapacities();
+        }
+        
+        // Shutdown catalog
         caliby::IndexCatalog::instance().shutdown();
         
         // Unregister all non-zero indexes from the BufferManager
@@ -1134,4 +1151,322 @@ num_threads : int, optional
              "Get detailed information about an index.")
         .def("data_dir", &caliby::IndexCatalog::data_dir,
              "Get the data directory path.");
+
+    // =========================================================================================
+    // Collection Bindings
+    // =========================================================================================
+
+    py::enum_<caliby::FieldType>(m, "FieldType")
+        .value("STRING", caliby::FieldType::STRING)
+        .value("INT", caliby::FieldType::INT)
+        .value("FLOAT", caliby::FieldType::FLOAT)
+        .value("BOOL", caliby::FieldType::BOOL)
+        .value("STRING_ARRAY", caliby::FieldType::STRING_ARRAY)
+        .value("INT_ARRAY", caliby::FieldType::INT_ARRAY)
+        .export_values();
+
+    py::class_<caliby::FieldDef>(m, "FieldDef")
+        .def(py::init<>())
+        .def(py::init<const std::string&, caliby::FieldType, bool>(),
+             py::arg("name"), py::arg("type"), py::arg("nullable") = true)
+        .def_readwrite("name", &caliby::FieldDef::name)
+        .def_readwrite("type", &caliby::FieldDef::type)
+        .def_readwrite("nullable", &caliby::FieldDef::nullable);
+
+    py::class_<caliby::Schema>(m, "Schema")
+        .def(py::init<>())
+        .def("add_field", &caliby::Schema::add_field,
+             py::arg("name"), py::arg("type"), py::arg("nullable") = true,
+             "Add a field to the schema.")
+        .def("has_field", &caliby::Schema::has_field, py::arg("name"),
+             "Check if a field exists in the schema.")
+        .def("get_field", &caliby::Schema::get_field, py::arg("name"),
+             py::return_value_policy::reference,
+             "Get a field definition by name.")
+        .def("fields", &caliby::Schema::fields,
+             "Get all field definitions.");
+
+    py::class_<caliby::Document>(m, "Document")
+        .def(py::init<>())
+        .def(py::init([](uint64_t id, const std::string& content, const py::object& meta) {
+            caliby::Document doc;
+            doc.id = id;
+            doc.content = content;
+            if (!meta.is_none()) {
+                py::module_ json_module = py::module_::import("json");
+                std::string json_str = py::cast<std::string>(json_module.attr("dumps")(meta));
+                doc.metadata = nlohmann::json::parse(json_str);
+            } else {
+                doc.metadata = nlohmann::json::object();
+            }
+            return doc;
+        }), py::arg("id"), py::arg("content") = "", py::arg("metadata") = py::none())
+        .def_readwrite("id", &caliby::Document::id)
+        .def_readwrite("content", &caliby::Document::content)
+        .def_property("metadata",
+            [](const caliby::Document& d) {
+                // Convert nlohmann::json to Python dict
+                py::module_ json_module = py::module_::import("json");
+                std::string json_str = d.metadata.dump();
+                return json_module.attr("loads")(json_str);
+            },
+            [](caliby::Document& d, const py::object& meta) {
+                // Convert Python dict to nlohmann::json via string serialization
+                py::module_ json_module = py::module_::import("json");
+                std::string json_str = py::cast<std::string>(json_module.attr("dumps")(meta));
+                d.metadata = nlohmann::json::parse(json_str);
+            },
+            "Document metadata as a dictionary.")
+        .def("__repr__", [](const caliby::Document& d) {
+            return "<Document id=" + std::to_string(d.id) + ">";
+        });
+
+    py::class_<caliby::SearchResult>(m, "SearchResult")
+        .def_readonly("doc_id", &caliby::SearchResult::doc_id)
+        .def_readonly("score", &caliby::SearchResult::score)
+        .def_readonly("vector_score", &caliby::SearchResult::vector_score)
+        .def_readonly("text_score", &caliby::SearchResult::text_score)
+        .def_property_readonly("id", [](const caliby::SearchResult& r) {
+            return r.doc_id;  // Alias for doc_id
+        })
+        .def_property_readonly("document", [](const caliby::SearchResult& r) -> py::object {
+            if (!r.document.has_value()) {
+                return py::none();
+            }
+            // Create a Python dict representing the document
+            py::module_ json_module = py::module_::import("json");
+            py::dict d;
+            d["id"] = r.document->id;
+            d["content"] = r.document->content;
+            std::string meta_str = r.document->metadata.dump();
+            d["metadata"] = json_module.attr("loads")(meta_str);
+            return d;
+        })
+        .def("__repr__", [](const caliby::SearchResult& r) {
+            return "<SearchResult doc_id=" + std::to_string(r.doc_id) +
+                   " score=" + std::to_string(r.score) + ">";
+        });
+
+    py::enum_<caliby::FusionMethod>(m, "FusionMethod")
+        .value("RRF", caliby::FusionMethod::RRF)
+        .value("WEIGHTED", caliby::FusionMethod::WEIGHTED)
+        .export_values();
+
+    py::enum_<caliby::DistanceMetric>(m, "DistanceMetric")
+        .value("L2", caliby::DistanceMetric::L2)
+        .value("COSINE", caliby::DistanceMetric::COSINE)
+        .value("IP", caliby::DistanceMetric::IP)
+        .export_values();
+
+    py::class_<caliby::FusionParams>(m, "FusionParams")
+        .def(py::init<>())
+        .def_readwrite("method", &caliby::FusionParams::method)
+        .def_readwrite("rrf_k", &caliby::FusionParams::rrf_k)
+        .def_readwrite("vector_weight", &caliby::FusionParams::vector_weight)
+        .def_readwrite("text_weight", &caliby::FusionParams::text_weight);
+
+    py::class_<caliby::CollectionIndexInfo>(m, "CollectionIndexInfo")
+        .def_readonly("index_id", &caliby::CollectionIndexInfo::index_id)
+        .def_readonly("name", &caliby::CollectionIndexInfo::name)
+        .def_readonly("type", &caliby::CollectionIndexInfo::type)
+        .def_readonly("status", &caliby::CollectionIndexInfo::status)
+        .def_property_readonly("config", [](const caliby::CollectionIndexInfo& info) {
+            // Convert nlohmann::json to Python dict
+            py::module_ json_module = py::module_::import("json");
+            std::string json_str = info.config.dump();
+            return json_module.attr("loads")(json_str);
+        })
+        .def("__repr__", [](const caliby::CollectionIndexInfo& i) {
+            return "<CollectionIndexInfo name='" + i.name + "' type='" + i.type + "'>";
+        });
+
+    py::class_<caliby::Collection>(m, "Collection")
+        .def(py::init([](const std::string& name, const caliby::Schema& schema, 
+                         uint32_t vector_dim, caliby::DistanceMetric distance_metric) {
+            // Ensure system is initialized
+            initialize_system();
+            return new caliby::Collection(name, schema, vector_dim, distance_metric);
+        }), py::arg("name"), py::arg("schema"), py::arg("vector_dim") = 0,
+           py::arg("distance_metric") = caliby::DistanceMetric::COSINE,
+        "Create a new collection with the given name and schema.")
+        
+        .def_static("open", &caliby::Collection::open, py::arg("name"),
+             "Open an existing collection by name.")
+        
+        .def("name", &caliby::Collection::name, "Get the collection name.")
+        .def("schema", &caliby::Collection::schema, py::return_value_policy::reference,
+             "Get the collection schema.")
+        .def("doc_count", &caliby::Collection::doc_count, "Get the number of documents.")
+        .def("vector_dim", &caliby::Collection::vector_dim, "Get vector dimensions.")
+        .def("has_vectors", &caliby::Collection::has_vectors, "Check if collection supports vectors.")
+        
+        // Document operations (batch-oriented API)
+        .def("add", [](caliby::Collection& self, 
+                       const std::vector<std::string>& contents,
+                       const py::list& metadatas,
+                       const std::vector<std::vector<float>>& vectors) {
+            py::module_ json_module = py::module_::import("json");
+            std::vector<nlohmann::json> metas;
+            for (const auto& m : metadatas) {
+                std::string json_str = py::cast<std::string>(json_module.attr("dumps")(m));
+                metas.push_back(nlohmann::json::parse(json_str));
+            }
+            return self.add(contents, metas, vectors);
+        }, py::arg("contents"), py::arg("metadatas"),
+           py::arg("vectors") = std::vector<std::vector<float>>{},
+        "Add documents to the collection. Returns assigned document IDs.")
+        
+        .def("get", py::overload_cast<const std::vector<uint64_t>&>(&caliby::Collection::get),
+             py::arg("ids"), "Get documents by IDs.")
+        
+        .def("update", [](caliby::Collection& self,
+                          const std::vector<uint64_t>& ids,
+                          const py::list& metadatas) {
+            py::module_ json_module = py::module_::import("json");
+            std::vector<nlohmann::json> metas;
+            for (const auto& m : metadatas) {
+                std::string json_str = py::cast<std::string>(json_module.attr("dumps")(m));
+                metas.push_back(nlohmann::json::parse(json_str));
+            }
+            self.update(ids, metas);
+        }, py::arg("ids"), py::arg("metadatas"),
+        "Update document metadata.")
+        
+        .def("delete", py::overload_cast<const std::vector<uint64_t>&>(&caliby::Collection::delete_docs),
+             py::arg("ids"), "Delete documents by IDs.")
+        
+        // Index creation
+        .def("create_hnsw_index", &caliby::Collection::create_hnsw_index,
+             py::arg("name"), py::arg("M") = 16, py::arg("ef_construction") = 200,
+             "Create an HNSW index for vector search.")
+        
+        .def("create_diskann_index", &caliby::Collection::create_diskann_index,
+             py::arg("name"), py::arg("R") = 64, py::arg("L") = 100, py::arg("alpha") = 1.2f,
+             "Create a DiskANN index for vector search.")
+        
+        .def("create_text_index", [](caliby::Collection& self, const std::string& name) {
+            self.create_text_index(name, caliby::TextIndexConfig{});
+        }, py::arg("name"),
+        "Create a text index with BM25 scoring.")
+        
+        // New API: create_metadata_index with support for composite indices
+        .def("create_metadata_index", [](caliby::Collection& self, const std::string& name,
+                                          const std::vector<std::string>& fields, bool unique) {
+            caliby::MetadataIndexConfig config(fields, unique);
+            self.create_metadata_index(name, config);
+        }, py::arg("name"), py::arg("fields"), py::arg("unique") = false,
+        R"doc(Create a metadata index on one or more fields.
+
+Supports composite indices with leftmost prefix rule (like MySQL secondary indices).
+
+Args:
+    name: Index name
+    fields: List of field names to index. For composite indices, order matters.
+    unique: Whether the full composite key must be unique (default: False)
+
+Examples:
+    # Single-field index
+    collection.create_metadata_index("year_idx", ["year"])
+    
+    # Composite index - can efficiently query:
+    #   - category = 'tech'
+    #   - category = 'tech' AND year = 2024
+    # Cannot efficiently query:
+    #   - year = 2024 (leftmost field missing)
+    collection.create_metadata_index("category_year_idx", ["category", "year"])
+)doc")
+        
+        // Legacy API: create_btree_index (single field only, for backward compatibility)
+        .def("create_btree_index", [](caliby::Collection& self, const std::string& name,
+                                       const std::string& field, bool unique) {
+            caliby::MetadataIndexConfig config({field}, unique);
+            self.create_metadata_index(name, config);
+        }, py::arg("name"), py::arg("field"), py::arg("unique") = false,
+        "Create a B-tree index on a metadata field. (Legacy API - use create_metadata_index instead)")
+        
+        .def("list_indices", [](caliby::Collection& self) {
+            py::list result;
+            py::module_ json_module = py::module_::import("json");
+            for (const auto& info : self.list_indices()) {
+                py::dict d;
+                d["index_id"] = info.index_id;
+                d["name"] = info.name;
+                d["type"] = info.type;
+                d["status"] = info.status;
+                std::string config_str = info.config.dump();
+                d["config"] = json_module.attr("loads")(config_str);
+                result.append(d);
+            }
+            return result;
+        }, "List all indices in the collection.")
+        
+        .def("drop_index", &caliby::Collection::drop_index, py::arg("name"),
+             "Drop an index by name.")
+        
+        // Search operations
+        .def("search_vector", [](caliby::Collection& self,
+                                  py::array_t<float, py::array::c_style | py::array::forcecast> query,
+                                  const std::string& index_name,
+                                  size_t k,
+                                  const std::string& filter_json) {
+            std::vector<float> q(query.data(), query.data() + query.size());
+            std::optional<caliby::FilterCondition> filter;
+            if (!filter_json.empty()) {
+                filter = caliby::FilterCondition::from_json(nlohmann::json::parse(filter_json));
+            }
+            return self.search_vector(q, index_name, k, filter);
+        }, py::arg("query"), py::arg("index_name"), py::arg("k"), py::arg("filter") = "",
+        "Search for similar vectors. Optional filter as JSON string.")
+        
+        .def("search_text", [](caliby::Collection& self,
+                               const std::string& query,
+                               const std::string& index_name,
+                               size_t k,
+                               const std::string& filter_json) {
+            std::optional<caliby::FilterCondition> filter;
+            if (!filter_json.empty()) {
+                filter = caliby::FilterCondition::from_json(nlohmann::json::parse(filter_json));
+            }
+            return self.search_text(query, index_name, k, filter);
+        }, py::arg("query"), py::arg("index_name"), py::arg("k"), py::arg("filter") = "",
+        "Search text using BM25 scoring. Optional filter as JSON string.")
+        
+        .def("search_hybrid", [](caliby::Collection& self,
+                                  py::array_t<float, py::array::c_style | py::array::forcecast> query_vec,
+                                  const std::string& vector_index,
+                                  const std::string& query_text,
+                                  const std::string& text_index,
+                                  size_t k,
+                                  const caliby::FusionParams& fusion,
+                                  const std::string& filter_json) {
+            std::vector<float> q(query_vec.data(), query_vec.data() + query_vec.size());
+            std::optional<caliby::FilterCondition> filter;
+            if (!filter_json.empty()) {
+                filter = caliby::FilterCondition::from_json(nlohmann::json::parse(filter_json));
+            }
+            return self.search_hybrid(q, vector_index, query_text, text_index, k, fusion, filter);
+        }, py::arg("query_vec"), py::arg("vector_index"),
+           py::arg("query_text"), py::arg("text_index"),
+           py::arg("k"), py::arg("fusion") = caliby::FusionParams{},
+           py::arg("filter") = "",
+        "Perform hybrid vector + text search with score fusion.")
+        
+        .def("flush", &caliby::Collection::flush, "Flush all changes to storage.");
+
+    // FilterCondition helper for building filters in Python
+    m.def("make_filter", [](const std::string& json) {
+        return caliby::FilterCondition::from_json(nlohmann::json::parse(json));
+    }, py::arg("json"), 
+    R"doc(
+Create a filter condition from a JSON string.
+
+Filter DSL examples:
+  - {"field": "age", "op": "gt", "value": 18}
+  - {"field": "status", "op": "eq", "value": "active"}
+  - {"and": [{"field": "age", "op": "gte", "value": 21}, {"field": "country", "op": "eq", "value": "US"}]}
+  - {"or": [{"field": "category", "op": "eq", "value": "A"}, {"field": "category", "op": "eq", "value": "B"}]}
+  - {"not": {"field": "deleted", "op": "eq", "value": true}}
+
+Supported operators: eq, ne, gt, gte, lt, lte, in, contains
+)doc");
 }

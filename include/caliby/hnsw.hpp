@@ -238,8 +238,12 @@ class HNSW {
     }
 
    public:
-    // Add a point to the index.
+    // Add a point to the index (auto-assigns sequential node_id).
     void addPoint(const float* point, u32& node_id_out);
+    
+    // Add a point with a specific node_id (e.g., doc_id). 
+    // The caller is responsible for ensuring node_id is unique and within max_elements.
+    void addPointWithId(const float* point, u32 node_id);
 
     // Search for the K nearest neighbors for a single query.
     template <bool stats = false>
@@ -251,6 +255,12 @@ class HNSW {
                                                                        size_t ef_search_param, size_t num_threads = 0);
     // Add a batch of points to the index in parallel.
     void addPoint_parallel(std::span<const float> points, size_t num_threads = 0);
+    
+    // Add a batch of points with specific IDs in parallel.
+    // Useful for Collection where doc_id must be used as node_id.
+    void addPointsWithIdsParallel(const std::vector<const float*>& data_ptrs,
+                                  const std::vector<uint32_t>& ids,
+                                  size_t num_threads = 0);
 
     HNSW(const HNSW&) = delete;
     HNSW& operator=(const HNSW&) = delete;

@@ -2,6 +2,43 @@
 
 Comprehensive benchmarks comparing Caliby against other popular vector search libraries.
 
+## Available Benchmarks
+
+### 1. Multi-Database Comparison (Caliby vs ChromaDB vs Qdrant vs Weaviate)
+**Full vector database comparison** - Tests document storage, retrieval, vector search, filtered search, and hybrid search
+- **Script**: `compare_vectordb.py`
+- **Documentation**: [CHROMADB_BENCHMARK.md](CHROMADB_BENCHMARK.md)
+- **What's tested**: Insertion throughput, document retrieval, vector search, filtered search, hybrid search, storage efficiency
+- **Dataset**: SIFT1M (1M vectors, 128 dimensions)
+- **Databases**: Caliby (your implementation), ChromaDB, Qdrant, Weaviate (all local/embedded)
+
+```bash
+# Install dependencies
+pip install chromadb qdrant-client weaviate-client
+
+# Quick start - Compare all databases
+python compare_vectordb.py --num-vectors 100000
+
+# Compare specific databases
+python compare_vectordb.py --caliby-only --num-vectors 100000
+python compare_vectordb.py --chromadb-only --num-vectors 100000
+python compare_vectordb.py --qdrant-only --num-vectors 100000
+python compare_vectordb.py --weaviate-only --num-vectors 100000
+```
+
+### 2. HNSW Comparison
+Compare HNSW implementations across Caliby, Usearch, and Faiss
+- **Script**: `compare_hnsw.py`
+- **Dataset**: SIFT1M
+
+### 3. DiskANN Comparison
+Compare DiskANN implementations
+- **Script**: `compare_diskann.py`
+
+### 4. IVF+PQ Comparison
+Compare quantization-based indexes with FAISS
+- **Script**: `compare_ivfpq_faiss.py`
+
 ## IVF+PQ Benchmark
 
 ### FAISS IVF+PQ Baseline Results (SIFT1M)

@@ -1,18 +1,21 @@
 # Caliby 🚀
 
-**High-Performance Vector Search with Efficient Larger-Than-Memory Support**
+**High-Performance Embeddable Vector Database with Document Storage, Hybrid Search, and Filtering**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Linux](https://img.shields.io/badge/platform-linux-lightgrey.svg)](https://www.linux.org/)
 
-Caliby is a high-performance vector similarity search library that efficiently handles datasets larger than available memory. Built on an innovative buffer pool design, Caliby delivers **best-in-class in-memory performance when data fits in RAM** and **graceful degradation when it doesn't** — without requiring expensive hardware or complex distributed systems.
+Caliby is a high-performance embeddable vector database that combines document storage, semantic search, full-text search, and metadata filtering in a single library. Built on an innovative buffer pool architecture, Caliby efficiently handles datasets larger than available memory while delivering **in-memory speed when data fits in RAM** and **graceful degradation when it doesn't** — no expensive hardware or distributed systems required.
 
 ## ✨ Key Features
 
-- **🔥 In-Memory Speed**: Matches or exceeds HNSWLib/Faiss/Usearch performance when data fits in memory
-- **💾 Larger-Than-Memory**: Seamlessly handles datasets that exceed RAM with minimal performance loss
-- **🎯 Multiple Index Types**: HNSW, DISKANN, and IVF+PQ
+- **📚 Document Storage**: Store vectors, text, and metadata with flexible schemas
+- **🔍 Filtered Search**: Efficient vector search with metadata filtering
+- **🔗 Hybrid Search**: Combine vector similarity and BM25 full-text search
+- **🔥 In-Memory Speed**: Matches or exceeds HNSWLib/Faiss/Usearch when data fits in RAM
+- **💾 Larger-Than-Memory**: Seamless performance with datasets exceeding available memory
+- **🎯 Multiple Index Types**: Inverted Index, B+tree, HNSW, DiskANN, and IVF+PQ algorithms
 - **🔧 Embeddable**: Single-process library, no server required
 
 ## 🚀 Quick Start
@@ -56,7 +59,57 @@ pip install -e .
 git submodule update --init --recursive
 ```
 
-### Basic Usage
+### Collection API (Recommended)
+
+The Collection API provides a high-level interface for storing documents with vectors, text, and metadata:
+
+```python
+import caliby
+import numpy as np
+
+# Initialize and create a collection
+caliby.set_buffer_config(size_gb=1.0)
+caliby.open('/tmp/my_database')
+collection = caliby.create_collection("products")
+
+# Define schema
+collection.set_schema({
+    "embedding": {"type": "vector", "dim": 128},
+    "description": {"type": "text"},
+    "category": {"type": "metadata"}
+})
+
+# Add documents
+collection.add_documents([
+    {"id": "1", "embedding": np.random.rand(128).astype('float32'),
+     "description": "Wireless headphones", "category": "electronics"},
+    {"id": "2", "embedding": np.random.rand(128).astype('float32'),
+     "description": "Running shoes", "category": "sports"}
+])
+
+# Create indices
+collection.create_hnsw_index("embedding", m=16, ef_construction=200)
+collection.create_text_index("description")
+collection.create_metadata_index("category")
+
+# Vector search with filter (99.5% recall)
+query = np.random.rand(128).astype('float32')
+results = collection.search_vector("embedding", query, k=10, 
+                                   filter={"category": "electronics"})
+
+# Hybrid search (vector + text)
+results = collection.search_hybrid("embedding", query, 
+                                   text_field="description",
+                                   text_query="wireless", k=10, alpha=0.5)
+
+caliby.close()
+```
+
+📖 **See [docs/COLLECTION_API.md](docs/COLLECTION_API.md) for complete documentation** including advanced filtering, best practices, and performance tuning.
+
+### Low-Level Index API
+
+For direct control over indices:
 
 ```python
 import caliby
@@ -372,7 +425,11 @@ cd build && ctest --output-on-failure
 pytest python/tests/
 ```
 
-## 📚 Documentation[WORK IN PROGRESS]
+## 📚 Documentation
+
+- **[Collection API Guide](docs/COLLECTION_API.md)** - High-level API for documents with vectors, text, and metadata
+- **[Usage Guide](docs/USAGE.md)** - General usage patterns and examples
+- **[Benchmarks](benchmark/README.md)** - Performance comparisons and benchmarking tools
 
 ## 🤝 Contributing
 

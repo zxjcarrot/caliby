@@ -1172,6 +1172,67 @@ void HNSW<DistanceMetric>::addPoint_parallel(std::span<const float> points, size
 }
 
 template <typename DistanceMetric>
+void HNSW<DistanceMetric>::addPointsWithIdsParallel(const std::vector<const float*>& data_ptrs,
+                                                     const std::vector<uint32_t>& ids,
+                                                     size_t num_threads) {
+    if (data_ptrs.empty() || ids.empty()) return;
+    if (data_ptrs.size() != ids.size()) {
+        throw std::invalid_argument("data_ptrs and ids must have the same size.");
+    }
+    
+    size_t num_points = data_ptrs.size();
+    
+    // Update node count to max(current, max_id + 1) to ensure all IDs are valid
+    {
+        GuardX<HNSWMetadataPage> meta_guard(metadata_pid);
+        u32 max_id = *std::max_element(ids.begin(), ids.end());
+        u32 current_count = meta_guard->node_count.load();
+        if (max_id >= current_count) {
+            if (max_id >= max_elements_) {
+                throw std::runtime_error("Cannot add items; node_id would exceed max_elements.");
+            }
+            meta_guard->node_count.store(max_id + 1);
+        }
+        meta_guard->dirty = true;
+    }
+    
+    size_t threads_to_use = (num_threads == 0) ? std::thread::hardware_concurrency() : num_threads;
+    threads_to_use = std::min(threads_to_use, num_points);
+    
+    if (threads_to_use <= 1) {
+        // Single-threaded insertion
+        for (size_t i = 0; i < num_points; ++i) {
+            addPoint_internal(data_ptrs[i], ids[i]);
+        }
+    } else {
+        // Parallel insertion using thread pool
+        ThreadPool* pool = getOrCreateAddPool(threads_to_use);
+        std::vector<std::future<void>> futures;
+        futures.reserve(threads_to_use);
+        
+        // Pre-partition work: each thread gets a contiguous range of points
+        size_t chunk = num_points / threads_to_use;
+        size_t remainder = num_points % threads_to_use;
+        
+        for (size_t thread_idx = 0; thread_idx < threads_to_use; ++thread_idx) {
+            size_t start = thread_idx * chunk + std::min(thread_idx, remainder);
+            size_t extra = (thread_idx < remainder) ? 1 : 0;
+            size_t end = start + chunk + extra;
+            
+            futures.emplace_back(pool->enqueue([this, &data_ptrs, &ids, start, end]() {
+                for (size_t i = start; i < end; ++i) {
+                    this->addPoint_internal(data_ptrs[i], ids[i]);
+                }
+            }));
+        }
+        
+        for (auto& future : futures) {
+            future.get();
+        }
+    }
+}
+
+template <typename DistanceMetric>
 void HNSW<DistanceMetric>::addPoint(const float* point, u32& node_id_out) {
     u32 new_node_id;
     {
@@ -1185,6 +1246,23 @@ void HNSW<DistanceMetric>::addPoint(const float* point, u32& node_id_out) {
     }
     node_id_out = new_node_id;
     addPoint_internal(point, new_node_id);
+}
+
+template <typename DistanceMetric>
+void HNSW<DistanceMetric>::addPointWithId(const float* point, u32 node_id) {
+    if (node_id >= max_elements_) {
+        throw std::runtime_error("HNSW: node_id exceeds max_elements.");
+    }
+    {
+        GuardX<HNSWMetadataPage> meta_guard(metadata_pid);
+        // Update node_count to be at least node_id + 1 (for proper page allocation tracking)
+        u64 current_count = meta_guard->node_count.load();
+        if (node_id >= current_count) {
+            meta_guard->node_count.store(node_id + 1);
+        }
+        meta_guard->dirty = true;
+    }
+    addPoint_internal(point, node_id);
 }
 
 template <typename DistanceMetric>
@@ -1209,8 +1287,32 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchKnn(const float* 
         return {}; // Index is empty
     }
 
-    // --- 2. Greedily search upper layers to find the best entry point for layer 0 ---
-    std::pair<float, u32> entry_point_for_layer0 = {0.0f, enter_point_id};
+    // Get IndexTranslationArray once for this index to avoid TLS lookups in tight loop
+    IndexTranslationArray* index_array = bm.getIndexArray(index_id_);
+
+    // --- 2. Calculate initial distance to entry point ---
+    float entry_dist;
+    for (;;) {
+        try {
+            GuardORelaxed<HNSWPage> initial_guard(getNodePID(enter_point_id), index_array);
+            NodeAccessor initial_acc(initial_guard.ptr, getNodeIndexInPage(enter_point_id), this);
+            if (stats) {
+                entry_dist = this->calculateDistance(query, initial_acc.getVector());
+            } else {
+                entry_dist = DistanceMetric::compare(query, initial_acc.getVector(), Dim);
+            }
+            // Debug: Print the computed distance (uncomment for debugging)
+            // std::cerr << "[DEBUG searchKnn] enter_point_id=" << enter_point_id 
+            //           << " entry_dist=" << entry_dist 
+            //           << " max_l=" << max_l << std::endl;
+        } catch (const OLCRestartException&) {
+            continue;
+        }
+        break;
+    }
+
+    // --- 3. Greedily search upper layers to find the best entry point for layer 0 ---
+    std::pair<float, u32> entry_point_for_layer0 = {entry_dist, enter_point_id};
     
     if (max_l > 0) {
         // This call will find the best entry for layer 1 and return its ID and distance.
@@ -1383,6 +1485,7 @@ std::string HNSW<DistanceMetric>::getIndexInfo() const {
 }
 
 // --- Explicit Template Instantiation ---
+// L2 Distance
 template class HNSW<hnsw_distance::SIMDAcceleratedL2>;
 
 // Explicit instantiation for templated member functions
@@ -1398,3 +1501,33 @@ template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::findBestE
 template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::findBestEntryPointForLevel<false>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
 template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchBaseLayer<true>(const float* query, u32 entry_point_id, int start_level, int end_level);
 template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchBaseLayer<false>(const float* query, u32 entry_point_id, int start_level, int end_level);
+
+// Inner Product Distance
+template class HNSW<hnsw_distance::SIMDAcceleratedIP>;
+
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedIP>::searchKnn<true>(const float* query, size_t k, size_t ef_search_param);
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedIP>::searchKnn<false>(const float* query, size_t k, size_t ef_search_param);
+template std::vector<std::vector<std::pair<float, u32>>> HNSW<hnsw_distance::SIMDAcceleratedIP>::searchKnn_parallel<true>(std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads);
+template std::vector<std::vector<std::pair<float, u32>>> HNSW<hnsw_distance::SIMDAcceleratedIP>::searchKnn_parallel<false>(std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads);
+
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedIP>::searchLayer<true>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedIP>::searchLayer<false>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedIP>::findBestEntryPointForLevel<true>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedIP>::findBestEntryPointForLevel<false>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedIP>::searchBaseLayer<true>(const float* query, u32 entry_point_id, int start_level, int end_level);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedIP>::searchBaseLayer<false>(const float* query, u32 entry_point_id, int start_level, int end_level);
+
+// Cosine Distance
+template class HNSW<hnsw_distance::SIMDAcceleratedCosine>;
+
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedCosine>::searchKnn<true>(const float* query, size_t k, size_t ef_search_param);
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedCosine>::searchKnn<false>(const float* query, size_t k, size_t ef_search_param);
+template std::vector<std::vector<std::pair<float, u32>>> HNSW<hnsw_distance::SIMDAcceleratedCosine>::searchKnn_parallel<true>(std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads);
+template std::vector<std::vector<std::pair<float, u32>>> HNSW<hnsw_distance::SIMDAcceleratedCosine>::searchKnn_parallel<false>(std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads);
+
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedCosine>::searchLayer<true>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedCosine>::searchLayer<false>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedCosine>::findBestEntryPointForLevel<true>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedCosine>::findBestEntryPointForLevel<false>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedCosine>::searchBaseLayer<true>(const float* query, u32 entry_point_id, int start_level, int end_level);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedCosine>::searchBaseLayer<false>(const float* query, u32 entry_point_id, int start_level, int end_level);
