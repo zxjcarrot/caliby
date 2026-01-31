@@ -1,4 +1,5 @@
 #include "hnsw.hpp"
+#include "logging.hpp"
 
 #include <immintrin.h>
 #include <cstdio>
@@ -79,8 +80,7 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
         throw std::runtime_error("HNSW dimension must be greater than zero.");
     }
 
-    printf("HNSW Initialization: Dim=%zu, M=%zu, M0=%zu, efConstruction=%zu, MaxLevel=%zu, FixedNodeSize=%zu bytes, NodesPerPage=%zu, enable_prefetch=%d\n",
-           Dim, M, M0, efConstruction, MaxLevel, FixedNodeSize, MaxNodesPerPage, enable_prefetch_);
+    CALIBY_LOG_INFO("HNSW", "Initialization: Dim=", Dim, ", M=", M, ", M0=", M0, ", efConstruction=", efConstruction, ", MaxLevel=", MaxLevel, ", FixedNodeSize=", FixedNodeSize, " bytes, NodesPerPage=", MaxNodesPerPage, ", enable_prefetch=", enable_prefetch_);
     // Validate that we can fit at least one node per page
     if (MaxNodesPerPage == 0) {
         throw std::runtime_error(
@@ -117,37 +117,36 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
                               meta_info->ef_construction == efConstruction &&
                               meta_info->max_level == MaxLevel;
 
-    std::cout << "[HNSW Recovery] skip_recovery=" << (skip_recovery_param ? "true" : "false")
-              << " has_existing_meta=" << (has_existing_meta ? "true" : "false") << std::endl;
+    CALIBY_LOG_DEBUG("HNSW", "Recovery: skip_recovery=", (skip_recovery_param ? "true" : "false"),
+              " has_existing_meta=", (has_existing_meta ? "true" : "false"));
     if (has_existing_meta) {
-    std::cout << "[HNSW Recovery] stored meta: max_elements=" << meta_info->max_elements
-          << " dim=" << meta_info->dim << " M=" << meta_info->M
-          << " ef_construction=" << meta_info->ef_construction
-          << " max_level=" << meta_info->max_level
-          << " metadata_pid=" << meta_info->metadata_pid
-          << " base_pid=" << meta_info->base_pid
-          << " valid_flag=" << static_cast<u32>(meta_info->valid) << std::endl;
+    CALIBY_LOG_DEBUG("HNSW", "Recovery: stored meta: max_elements=", meta_info->max_elements,
+          " dim=", meta_info->dim, " M=", meta_info->M,
+          " ef_construction=", meta_info->ef_construction,
+          " max_level=", meta_info->max_level,
+          " metadata_pid=", meta_info->metadata_pid,
+          " base_pid=", meta_info->base_pid,
+          " valid_flag=", static_cast<u32>(meta_info->valid));
     }
-    std::cout << "[HNSW Recovery] params_match=" << (params_match ? "true" : "false") << std::endl;
+    CALIBY_LOG_DEBUG("HNSW", "Recovery: params_match=", (params_match ? "true" : "false"));
     if (has_existing_meta && !params_match) {
         if (meta_info->max_elements != max_elements) {
-            std::cout << "[HNSW Recovery] mismatch: stored max_elements=" << meta_info->max_elements
-                      << " requested=" << max_elements << std::endl;
+            CALIBY_LOG_DEBUG("HNSW", "Recovery: mismatch: stored max_elements=", meta_info->max_elements,
+                      " requested=", max_elements);
         }
         if (meta_info->dim != Dim) {
-            std::cout << "[HNSW Recovery] mismatch: stored dim=" << meta_info->dim << " requested=" << Dim
-                      << std::endl;
+            CALIBY_LOG_DEBUG("HNSW", "Recovery: mismatch: stored dim=", meta_info->dim, " requested=", Dim);
         }
         if (meta_info->M != M) {
-            std::cout << "[HNSW Recovery] mismatch: stored M=" << meta_info->M << " requested=" << M << std::endl;
+            CALIBY_LOG_DEBUG("HNSW", "Recovery: mismatch: stored M=", meta_info->M, " requested=", M);
         }
         if (meta_info->ef_construction != efConstruction) {
-            std::cout << "[HNSW Recovery] mismatch: stored ef_construction=" << meta_info->ef_construction
-                      << " requested=" << efConstruction << std::endl;
+            CALIBY_LOG_DEBUG("HNSW", "Recovery: mismatch: stored ef_construction=", meta_info->ef_construction,
+                      " requested=", efConstruction);
         }
         if (meta_info->max_level != MaxLevel) {
-            std::cout << "[HNSW Recovery] mismatch: stored max_level=" << meta_info->max_level
-                      << " requested=" << MaxLevel << std::endl;
+            CALIBY_LOG_DEBUG("HNSW", "Recovery: mismatch: stored max_level=", meta_info->max_level,
+                      " requested=", MaxLevel);
         }
     }
 
@@ -158,30 +157,29 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
         this->max_elements_ = meta_info->max_elements;
         recovered = true;
         recovered_from_disk_ = true;
-        std::cout << "[HNSW Recovery] Recovered existing index. metadata_pid=" << this->metadata_pid
-                  << " base_pid=" << this->base_pid << std::endl;
+        CALIBY_LOG_INFO("HNSW", "Recovery: Recovered existing index. metadata_pid=", this->metadata_pid,
+                  " base_pid=", this->base_pid);
         try {
             GuardO<HNSWMetadataPage> meta_guard(this->metadata_pid);
             auto persisted_nodes = meta_guard->node_count.load(std::memory_order_acquire);
             auto persisted_level = meta_guard->max_level.load(std::memory_order_acquire);
-            std::cout << "[HNSW Recovery] persisted node_count=" << persisted_nodes
-                      << " max_level=" << persisted_level
-                      << " entry_point=" << meta_guard->enter_point_node_id << std::endl;
+            CALIBY_LOG_DEBUG("HNSW", "Recovery: persisted node_count=", persisted_nodes,
+                      " max_level=", persisted_level,
+                      " entry_point=", meta_guard->enter_point_node_id);
         } catch (const OLCRestartException&) {
-            std::cout << "[HNSW Recovery] metadata read retry failed during logging" << std::endl;
+            CALIBY_LOG_WARN("HNSW", "Recovery: metadata read retry failed during logging");
         }
     } else {
         if (has_existing_meta) {
             meta_info->valid = 0;
             meta_page_guard->dirty = true;
-            std::cout << "[HNSW Recovery] Existing metadata invalidated for rebuild" << std::endl;
+            CALIBY_LOG_INFO("HNSW", "Recovery: Existing metadata invalidated for rebuild");
         }
 
         const bool can_reuse_storage = has_existing_meta && meta_info->dim == Dim && meta_info->M == M &&
                                        meta_info->ef_construction == efConstruction &&
                                        meta_info->max_level == MaxLevel && meta_info->max_elements >= max_elements;
-        std::cout << "[HNSW Recovery] can_reuse_storage=" << (can_reuse_storage ? "true" : "false")
-                  << std::endl;
+        CALIBY_LOG_DEBUG("HNSW", "Recovery: can_reuse_storage=", (can_reuse_storage ? "true" : "false"));
 
         if (can_reuse_storage && meta_info->metadata_pid != BufferManager::invalidPID &&
             meta_info->base_pid != BufferManager::invalidPID) {
@@ -194,8 +192,8 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
             meta_guard->enter_point_node_id = HNSWMetadataPage::invalid_node_id;
             meta_guard->max_level.store(0);
             meta_guard->dirty = true;
-            std::cout << "[HNSW Recovery] Reusing metadata page " << this->metadata_pid << " and base_pid "
-                      << this->base_pid << "; counters reset" << std::endl;
+            CALIBY_LOG_INFO("HNSW", "Recovery: Reusing metadata page ", this->metadata_pid, " and base_pid ",
+                      this->base_pid, "; counters reset");
 
             u64 total_pages = (max_elements + NodesPerPage - 1) / NodesPerPage;
             for (u64 i = 0; i < total_pages; ++i) {
@@ -203,7 +201,7 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
                 page_guard->node_count = 0;
                 page_guard->dirty = true;
             }
-            std::cout << "[HNSW Recovery] Reset " << total_pages << " data pages" << std::endl;
+            CALIBY_LOG_DEBUG("HNSW", "Recovery: Reset ", total_pages, " data pages");
         } else {
             meta_page_guard.release();
 
@@ -231,9 +229,9 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
                     AllocGuard<HNSWPage> page_guard(allocator_);
                     // Verify contiguous allocation
                     if (page_guard.pid != expected_pid) {
-                        std::cerr << "[HNSW Recovery] ERROR: Non-contiguous page allocation! Expected PID "
-                                  << expected_pid << " but got " << page_guard.pid << std::endl;
-                        std::cerr << "[HNSW Recovery] This breaks the assumption that pages are at base_pid + offset" << std::endl;
+                        CALIBY_LOG_ERROR("HNSW", "Recovery: Non-contiguous page allocation! Expected PID ",
+                                  expected_pid, " but got ", page_guard.pid);
+                        CALIBY_LOG_ERROR("HNSW", "Recovery: This breaks the assumption that pages are at base_pid + offset");
                         throw std::runtime_error("Non-contiguous HNSW page allocation");
                     }
                     page_guard->dirty = false;
@@ -245,8 +243,8 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
 
             this->base_pid = meta_guard->base_pid;
             meta_guard->dirty = true;
-            std::cout << "[HNSW Recovery] Allocated new metadata page " << this->metadata_pid
-                      << " base_pid=" << this->base_pid << " total_pages=" << total_pages << std::endl;
+            CALIBY_LOG_INFO("HNSW", "Recovery: Allocated new metadata page ", this->metadata_pid,
+                      " base_pid=", this->base_pid, " total_pages=", total_pages);
 
             // Explicitly release old guard before acquiring new one to avoid double-lock
             // Re-acquire global metadata page guard (was released at line 198)
@@ -266,7 +264,7 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
         meta_info->alloc_count.store(0, std::memory_order_relaxed);
         meta_info->valid = 1;
         meta_page_guard->dirty = true;
-        std::cout << "[HNSW Recovery] Metadata page updated and marked valid" << std::endl;
+        CALIBY_LOG_INFO("HNSW", "Recovery: Metadata page updated and marked valid");
     }
 
     visited_list_pool_ = std::unique_ptr<VisitedListPool>(new VisitedListPool(4, this->max_elements_));

@@ -17,6 +17,7 @@
 #include "hnsw.hpp"
 #include "ivfpq.hpp"
 #include "text_index.hpp"
+#include "logging.hpp"
 
 #if defined(_WIN32)
 #include <psapi.h>
@@ -108,7 +109,7 @@ PYBIND11_MODULE(caliby, m) {
     
     // Register cleanup function to be called at module unload
     auto cleanup = []() {
-        std::cout << "Calico module unloading: Shutting down system..." << std::endl;
+        CALIBY_LOG_INFO("Bindings", "Calico module unloading: Shutting down system...");
         shutdown_system();
     };
     m.add_object("_cleanup", py::capsule(cleanup));
@@ -197,6 +198,31 @@ PYBIND11_MODULE(caliby, m) {
     "Must be called before creating any indexes. "
     "size_gb: physical buffer size (resident pages), "
     "virtgb: virtual buffer size (total pages, defaults to 24GB - auto-computed per-index).");
+    
+    // --- Logging Configuration ---
+    py::enum_<caliby::LogLevel>(m, "LogLevel")
+        .value("DEBUG", caliby::LogLevel::DEBUG)
+        .value("INFO", caliby::LogLevel::INFO)
+        .value("WARN", caliby::LogLevel::WARN)
+        .value("ERROR", caliby::LogLevel::ERROR)
+        .value("OFF", caliby::LogLevel::OFF)
+        .export_values();
+    
+    m.def("set_log_level", [](caliby::LogLevel level) {
+        caliby::set_log_level(level);
+    }, py::arg("level"),
+    "Set the logging level using LogLevel enum. "
+    "Levels: DEBUG (verbose), INFO (normal), WARN (warnings only), ERROR (errors only), OFF (silent).");
+    
+    m.def("set_log_level", [](const std::string& level) {
+        caliby::set_log_level(caliby::string_to_log_level(level));
+    }, py::arg("level"),
+    "Set the logging level using a string. "
+    "Valid values: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'OFF' (case-insensitive).");
+    
+    m.def("get_log_level", []() {
+        return caliby::get_log_level();
+    }, "Get the current logging level.");
     
     m.def("force_evict_buffer_portion", [](float portion) {
         if (bm_ptr) {

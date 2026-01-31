@@ -1,5 +1,6 @@
 #include "calico.hpp"
 #include "catalog.hpp"
+#include "logging.hpp"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -101,8 +102,8 @@ void IndexCatalog::registerIndex(u32 index_id, u64 max_pages, int file_fd) {
     entry.file_fd = file_fd;
     entries[index_id] = std::move(entry);
     
-    std::cerr << "[IndexCatalog] Registered index " << index_id 
-              << " with max_pages=" << max_pages << std::endl;
+    CALIBY_LOG_DEBUG("IndexCatalog", "Registered index ", index_id, 
+                     " with max_pages=", max_pages);
 }
 
 void IndexCatalog::updateAllocCount(u32 index_id, u64 count) {
@@ -142,8 +143,8 @@ void IndexCatalog::persist() {
     
     std::ofstream ofs(catalog_file_path, std::ios::binary | std::ios::trunc);
     if (!ofs) {
-        std::cerr << "[IndexCatalog] Failed to open catalog file for writing: " 
-                  << catalog_file_path << std::endl;
+        CALIBY_LOG_ERROR("IndexCatalog", "Failed to open catalog file for writing: ", 
+                         catalog_file_path);
         return;
     }
     
@@ -163,8 +164,8 @@ void IndexCatalog::persist() {
     }
     
     ofs.close();
-    std::cerr << "[IndexCatalog] Persisted " << num_entries << " entries to " 
-              << catalog_file_path << std::endl;
+    CALIBY_LOG_DEBUG("IndexCatalog", "Persisted ", num_entries, " entries to ", 
+                     catalog_file_path);
 }
 
 void IndexCatalog::load() {
@@ -172,8 +173,8 @@ void IndexCatalog::load() {
     
     std::ifstream ifs(catalog_file_path, std::ios::binary);
     if (!ifs) {
-        std::cerr << "[IndexCatalog] Catalog file not found, starting fresh: " 
-                  << catalog_file_path << std::endl;
+        CALIBY_LOG_INFO("IndexCatalog", "Catalog file not found, starting fresh: ", 
+                        catalog_file_path);
         return;
     }
     
@@ -200,14 +201,14 @@ void IndexCatalog::load() {
     }
     
     ifs.close();
-    std::cerr << "[IndexCatalog] Loaded " << num_entries << " entries from " 
-              << catalog_file_path << std::endl;
+    CALIBY_LOG_DEBUG("IndexCatalog", "Loaded ", num_entries, " entries from ", 
+                     catalog_file_path);
 }
 
 void IndexCatalog::clear() {
     std::unique_lock<std::shared_mutex> lock(mutex);
     entries.clear();
-    std::cerr << "[IndexCatalog] Cleared all entries" << std::endl;
+    CALIBY_LOG_DEBUG("IndexCatalog", "Cleared all entries");
 }
 
 //=============================================================================
@@ -237,10 +238,9 @@ IndexTranslationArray::IndexTranslationArray(u32 indexId, u64 maxPages, u64 init
     // Allocate reference counts array
     refCounts = new std::atomic<u32>[numRefCountGroups]();
     
-    std::cerr << "[IndexTranslationArray] Created for index " << indexId
-              << " with initial capacity=" << initialCapacity << " pages (growable)"
-              << " (" << numRefCountGroups << " ref count groups)"
-              << std::endl;
+    CALIBY_LOG_DEBUG("IndexTranslationArray", "Created for index ", indexId,
+                     " with initial capacity=", initialCapacity, " pages (growable)",
+                     " (", numRefCountGroups, " ref count groups)");
 }
 
 bool IndexTranslationArray::ensureCapacity(u64 minCapacity) {
@@ -271,9 +271,9 @@ bool IndexTranslationArray::ensureCapacity(u64 minCapacity) {
     
     void* newPageStates = mremap(pageStates, oldSize, newSize, MREMAP_MAYMOVE);
     if (newPageStates == MAP_FAILED) {
-        std::cerr << "[IndexTranslationArray] mremap failed for index " << index_id
-                  << " trying to grow from " << currentCapacity << " to " << newCapacity
-                  << " pages, errno: " << errno << std::endl;
+        CALIBY_LOG_ERROR("IndexTranslationArray", "mremap failed for index ", index_id,
+                         " trying to grow from ", currentCapacity, " to ", newCapacity,
+                         " pages, errno: ", errno);
         return false;
     }
     
@@ -295,9 +295,8 @@ bool IndexTranslationArray::ensureCapacity(u64 minCapacity) {
     // Update capacity (atomic store with release semantics so other threads see new capacity)
     capacity.store(newCapacity, std::memory_order_release);
     
-    std::cerr << "[IndexTranslationArray] Grew index " << index_id
-              << " from " << currentCapacity << " to " << newCapacity << " pages"
-              << std::endl;
+    CALIBY_LOG_DEBUG("IndexTranslationArray", "Grew index ", index_id,
+                     " from ", currentCapacity, " to ", newCapacity, " pages");
     
     return true;
 }
@@ -389,8 +388,8 @@ void IndexTranslationArray::decrementRefCount(u64 localPageId, std::atomic<u64>&
                 if (result == 0) {
                     holePunchCounter.fetch_add(1, std::memory_order_relaxed);
                     } else {
-                    std::cerr << "[IndexTranslationArray] madvise MADV_DONTNEED failed for localPageId " 
-                              << localPageId << " group " << group << " errno: " << errno << std::endl;
+                    CALIBY_LOG_WARN("IndexTranslationArray", "madvise MADV_DONTNEED failed for localPageId ", 
+                                    localPageId, " group ", group, " errno: ", errno);
                 }
             }
             
@@ -423,10 +422,9 @@ TwoLevelPageStateArray::TwoLevelPageStateArray(u64 defaultIndexCapacity)
         indexArrays[0].store(defaultArray, std::memory_order_release);
     }
     
-    std::cerr << "[TwoLevelPageStateArray] Created multi-index translation array"
-              << " with " << numIndexSlots << " index slots"
-              << (defaultIndexCapacity > 0 ? ", default index capacity=" + std::to_string(defaultIndexCapacity) : "")
-              << std::endl;
+    CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Created multi-index translation array",
+                     " with ", numIndexSlots, " index slots",
+                     (defaultIndexCapacity > 0 ? std::string(", default index capacity=") + std::to_string(defaultIndexCapacity) : ""));
 }
 
 TwoLevelPageStateArray::~TwoLevelPageStateArray() {
@@ -439,7 +437,7 @@ TwoLevelPageStateArray::~TwoLevelPageStateArray() {
     }
     delete[] indexArrays;
     
-    std::cerr << "[TwoLevelPageStateArray] Destroyed multi-index translation array" << std::endl;
+    CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Destroyed multi-index translation array");
 }
 
 void TwoLevelPageStateArray::registerIndex(u32 indexId, u64 maxPages, u64 initialAllocCount, int fileFd) {
@@ -464,8 +462,8 @@ void TwoLevelPageStateArray::registerIndex(u32 indexId, u64 maxPages, u64 initia
         defaultArray = newArray;
     }
     
-    std::cerr << "[TwoLevelPageStateArray] Registered index " << indexId 
-              << " with capacity " << maxPages << std::endl;
+    CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Registered index ", indexId, 
+                     " with capacity ", maxPages);
 }
 
 void TwoLevelPageStateArray::unregisterIndex(u32 indexId) {
@@ -494,7 +492,7 @@ void TwoLevelPageStateArray::unregisterIndex(u32 indexId) {
     // Increment generation to invalidate all thread-local caches
     generation.fetch_add(1, std::memory_order_release);
     
-    std::cerr << "[TwoLevelPageStateArray] Unregistered index " << indexId << std::endl;
+    CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Unregistered index ", indexId);
 }
 
 void TwoLevelPageStateArray::unregisterAllNonZero() {
@@ -514,8 +512,8 @@ void TwoLevelPageStateArray::unregisterAllNonZero() {
         // Increment generation to invalidate all thread-local caches
         generation.fetch_add(1, std::memory_order_release);
         
-        std::cerr << "[TwoLevelPageStateArray] Unregistered " << unregisteredCount 
-                  << " non-zero indexes" << std::endl;
+        CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Unregistered ", unregisteredCount, 
+                         " non-zero indexes");
     }
 }
 
@@ -599,12 +597,11 @@ ThreeLevelPageStateArray::ThreeLevelPageStateArray(u64 virtCount)
     num_middle_slots = 1U << middleBits;
     entries_per_slot = 1U << bottomBits;
     
-    std::cerr << "[ThreeLevelPageStateArray] virtCount=" << virtCount 
-              << " totalBits=" << totalBits
-              << " topBits=" << topBits << " (" << num_top_slots << " slots)"
-              << " middleBits=" << middleBits << " (" << num_middle_slots << " slots)"
-              << " bottomBits=" << bottomBits << " (" << entries_per_slot << " entries/slot)"
-              << std::endl;
+    CALIBY_LOG_DEBUG("ThreeLevelPageStateArray", "virtCount=", virtCount, 
+                     " totalBits=", totalBits,
+                     " topBits=", topBits, " (", num_top_slots, " slots)",
+                     " middleBits=", middleBits, " (", num_middle_slots, " slots)",
+                     " bottomBits=", bottomBits, " (", entries_per_slot, " entries/slot)");
     
     // Allocate top-level array
     size_t top_size = num_top_slots * sizeof(PageState**);
@@ -713,24 +710,15 @@ LibaioInterface::LibaioInterface(int blockfd, BufferManager* bm_ptr) : blockfd(b
     memset(&ctx, 0, sizeof(io_context_t));
     int ret = io_setup(maxIOs, &ctx);
     if (ret != 0) {
-        std::cerr << "libaio io_setup error: " << ret << " ";
+        const char* errName = "UNKNOWN";
         switch (-ret) {
-            case EAGAIN:
-                std::cerr << "EAGAIN";
-                break;
-            case EFAULT:
-                std::cerr << "EFAULT";
-                break;
-            case EINVAL:
-                std::cerr << "EINVAL";
-                break;
-            case ENOMEM:
-                std::cerr << "ENOMEM";
-                break;
-            case ENOSYS:
-                std::cerr << "ENOSYS";
-                break;
-        };
+            case EAGAIN: errName = "EAGAIN"; break;
+            case EFAULT: errName = "EFAULT"; break;
+            case EINVAL: errName = "EINVAL"; break;
+            case ENOMEM: errName = "ENOMEM"; break;
+            case ENOSYS: errName = "ENOSYS"; break;
+        }
+        CALIBY_LOG_ERROR("LibaioInterface", "io_setup error: ", ret, " ", errName);
         exit(EXIT_FAILURE);
     }
 }
@@ -772,13 +760,12 @@ void LibaioInterface::writePages(const vector<PID>& pages) {
     while (submitted < validPages.size()) {
         int cnt = io_submit(ctx, validPages.size() - submitted, &cbPtr[submitted]);
         if (cnt < 0) {
-            std::cerr << "io_submit failed: " << cnt << " errno: " << -cnt << std::endl;
-            std::cerr.flush();
+            CALIBY_LOG_ERROR("LibaioInterface", "io_submit failed: ", cnt, " errno: ", -cnt);
             abort();
         }
         if (cnt == 0) {
             // No progress - this shouldn't happen
-            std::cerr << "io_submit returned 0, no progress possible" << std::endl;
+            CALIBY_LOG_ERROR("LibaioInterface", "io_submit returned 0, no progress possible");
             abort();
         }
         submitted += cnt;
@@ -786,7 +773,7 @@ void LibaioInterface::writePages(const vector<PID>& pages) {
     
     int cnt = io_getevents(ctx, validPages.size(), validPages.size(), events, nullptr);
     if (cnt != (int)validPages.size()) {
-        std::cerr << "io_getevents failed: " << cnt << " expected: " << validPages.size() << " errno: " << -cnt << std::endl;
+        CALIBY_LOG_ERROR("LibaioInterface", "io_getevents failed: ", cnt, " expected: ", validPages.size(), " errno: ", -cnt);
         exit(EXIT_FAILURE);
     }
 }
@@ -809,12 +796,12 @@ void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& d
 
     int cnt = io_submit(ctx, pages.size(), cbPtr);
     if (cnt != (int)pages.size()) {
-        std::cerr << "io_submit read failed: " << cnt << " expected: " << pages.size() << " errno: " << -cnt << std::endl;
+        CALIBY_LOG_ERROR("LibaioInterface", "io_submit read failed: ", cnt, " expected: ", pages.size(), " errno: ", -cnt);
         exit(EXIT_FAILURE);
     }
     cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
     if (cnt != (int)pages.size()) {
-        std::cerr << "io_getevents read failed: " << cnt << " expected: " << pages.size() << " errno: " << -cnt << std::endl;
+        CALIBY_LOG_ERROR("LibaioInterface", "io_getevents read failed: ", cnt, " expected: ", pages.size(), " errno: ", -cnt);
         exit(EXIT_FAILURE);
     }
 
@@ -860,7 +847,7 @@ BufferManager::BufferManager(unsigned nthreads)
     const char* path = getenv("BLOCK") ? getenv("BLOCK") : "./heapfile";
     blockfd = open(path, O_RDWR | O_DIRECT | O_CREAT, S_IRUSR | S_IWUSR);
     if (blockfd == -1) {
-        cerr << "cannot open BLOCK device '" << path << "'" << endl;
+        CALIBY_LOG_ERROR("BufferManager", "cannot open BLOCK device '", path, "'");
         exit(EXIT_FAILURE);
     }
 
@@ -1017,7 +1004,7 @@ BufferManager::BufferManager(unsigned nthreads)
         pageState2Level = nullptr;
         pageState3Level.reset();
         // print pageState address
-        std::cerr << "pageState: " << (void*)pageState  << " length " << virtCount * sizeof(PageState) << std::endl;
+        CALIBY_LOG_DEBUG("BufferManager", "pageState: ", (void*)pageState, " length ", virtCount * sizeof(PageState));
     }
     // Determine OS page size for translation array based on huge page usage
     // Must align with the actual allocation: 4KB if huge pages disabled, 2MB otherwise
@@ -1068,23 +1055,21 @@ BufferManager::BufferManager(unsigned nthreads)
     translation_specialization = "hash";
     #else
     #endif
-    cerr << "calico BufferManager initialized: "
-         << "blk:" << path << " virtgb:" << virtSize / gb << " physgb:" << (float)physSize / gb
-         << " traditional:" << useTraditional << " mmap_os_pagecache:" << useMmapOSPageacche
-         << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
-         << " hugepage for translation array: " << (disableHugePageForTranslationArray == 0)
-         << " num_threads:" << numThreads 
-         << " translation_specialization:" << translation_specialization
-         << endl;
+    CALIBY_LOG_INFO("BufferManager", "Initialized: blk:", path, " virtgb:", virtSize / gb, 
+                    " physgb:", (float)physSize / gb, " traditional:", useTraditional, 
+                    " mmap_os_pagecache:", useMmapOSPageacche, " trad_hash:", static_cast<int>(hashMode),
+                    " exmap:", useExmap, " hugepage:", (disableHugePageForFrameMem == 0),
+                    " hugepage_translation:", (disableHugePageForTranslationArray == 0),
+                    " num_threads:", numThreads, " specialization:", translation_specialization);
 }
 
 BufferManager::~BufferManager() {
     try {
         //flushAll();
     } catch (const std::exception& ex) {
-        std::cerr << "BufferManager::~BufferManager flush error: " << ex.what() << std::endl;
+        CALIBY_LOG_ERROR("BufferManager", "~BufferManager flush error: ", ex.what());
     } catch (...) {
-        std::cerr << "BufferManager::~BufferManager encountered an unknown error during flush." << std::endl;
+        CALIBY_LOG_ERROR("BufferManager", "~BufferManager encountered an unknown error during flush.");
     }
     
     // Cleanup lazily allocated reference counts
@@ -1099,13 +1084,15 @@ BufferManager::~BufferManager() {
             u32 count = translationRefCounts[i].load(std::memory_order_relaxed);
             histogram[count]++;
         }
-        std::cerr << "[BufferManager] Translation Reference Count Histogram:" << std::endl;
-        // sort the histogram by <ref count, num groups> and print them
-        std::vector<std::pair<u32, u64>> sorted_histogram(histogram.begin(), histogram.end());
-        std::sort(sorted_histogram.begin(), sorted_histogram.end());
-        for (const auto& entry : sorted_histogram)
-        {
-            std::cerr << "  Ref Count " << entry.first << ": " << entry.second << " groups" << std::endl;
+        if (caliby::is_log_enabled(caliby::LogLevel::DEBUG)) {
+            CALIBY_LOG_DEBUG("BufferManager", "Translation Reference Count Histogram:");
+            // sort the histogram by <ref count, num groups> and print them
+            std::vector<std::pair<u32, u64>> sorted_histogram(histogram.begin(), histogram.end());
+            std::sort(sorted_histogram.begin(), sorted_histogram.end());
+            for (const auto& entry : sorted_histogram)
+            {
+                CALIBY_LOG_DEBUG("BufferManager", "  Ref Count ", entry.first, ": ", entry.second, " groups");
+            }
         }
 
         size_t refCountSize = numRefCountGroups * sizeof(std::atomic<u32>);
@@ -1114,7 +1101,7 @@ BufferManager::~BufferManager() {
     }
 
     // print hole punch count
-    std::cerr << "[BufferManager] Total hole punches (madvise count): " << holePunchCount << std::endl;
+    CALIBY_LOG_DEBUG("BufferManager", "Total hole punches (madvise count): ", holePunchCount);
     
     // Persist catalog before shutdown
     if (indexCatalog) {
@@ -1527,8 +1514,8 @@ void BufferManager::releaseFrame(PID pid) {
                             if (result == 0) {
                                 holePunchCount.fetch_add(1, std::memory_order_relaxed);
                             } else {
-                                std::cerr << "madvise MADV_DONTNEED failed for pid " << pid
-                                          << " errno: " << errno << std::endl;
+                                CALIBY_LOG_WARN("BufferManager", "madvise MADV_DONTNEED failed for pid ", pid,
+                                                " errno: ", errno);
                             }
                         }
                         
@@ -1581,9 +1568,9 @@ void BufferManager::releaseFrame(PID pid) {
                                     if (result == 0) {
                                         holePunchCount.fetch_add(1, std::memory_order_relaxed);
                                     } else {
-                                        std::cerr << "[Array2Level] madvise MADV_DONTNEED failed for pid " << pid
-                                                  << " localPageId=" << localPageId << " group=" << group
-                                                  << " errno: " << errno << std::endl;
+                                        CALIBY_LOG_WARN("BufferManager", "[Array2Level] madvise MADV_DONTNEED failed for pid ", pid,
+                                                        " localPageId=", localPageId, " group=", group,
+                                                        " errno: ", errno);
                                     }
                                 }
                                 
@@ -1668,7 +1655,7 @@ Page* BufferManager::allocPage(PIDAllocator* allocator) {
         exmapInterface[workerThreadId]->iov[0].page = pid;
         exmapInterface[workerThreadId]->iov[0].len = 1;
         while (exmapAction(exmapfd, EXMAP_OP_ALLOC, 1) < 0) {
-            cerr << "allocPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
+            CALIBY_LOG_WARN("BufferManager", "allocPage errno: ", errno, " pid: ", pid, " workerId: ", workerThreadId);
             ensureFreePages();
         }
     }
@@ -1728,7 +1715,7 @@ Page* BufferManager::allocPageForIndex(u32 indexId, PIDAllocator* allocator) {
     if (localPid >= indexArray->capacity.load(std::memory_order_acquire)) {
         // Need more capacity - grow the array
         if (!indexArray->ensureCapacity(localPid + 1)) {
-            cerr << "Index " << indexId << " failed to grow capacity for page " << localPid << endl;
+            CALIBY_LOG_ERROR("BufferManager", "Index ", indexId, " failed to grow capacity for page ", localPid);
             exit(EXIT_FAILURE);  // Only fail if mremap fails (out of virtual address space)
         }
     }
@@ -1755,7 +1742,7 @@ Page* BufferManager::allocPageForIndex(u32 indexId, PIDAllocator* allocator) {
         exmapInterface[workerThreadId]->iov[0].page = globalPid;
         exmapInterface[workerThreadId]->iov[0].len = 1;
         while (exmapAction(exmapfd, EXMAP_OP_ALLOC, 1) < 0) {
-            cerr << "allocPageForIndex errno: " << errno << " pid: " << globalPid << " workerId: " << workerThreadId << endl;
+            CALIBY_LOG_WARN("BufferManager", "allocPageForIndex errno: ", errno, " pid: ", globalPid, " workerId: ", workerThreadId);
             ensureFreePages();
         }
     }
@@ -1933,7 +1920,7 @@ void BufferManager::readPage(PID pid, Page* dest) {
                 readCount++;
                 return;
             }
-            cerr << "readPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
+            CALIBY_LOG_WARN("BufferManager", "readPage errno: ", errno, " pid: ", pid, " workerId: ", workerThreadId);
             ensureFreePages();
         }
     } else {
@@ -2047,7 +2034,7 @@ void BufferManager::flushAll() {
     }
 
     flush_batch();
-    cerr << "BufferManager flushed " << flushed_pages << " pages." << endl;
+    CALIBY_LOG_INFO("BufferManager", "Flushed ", flushed_pages, " pages.");
 }
 
 void BufferManager::persistIndexCapacities() {
@@ -2071,7 +2058,7 @@ void BufferManager::persistIndexCapacities() {
         catalog.update_index_alloc_pages(indexId, capacity);
     }
     
-    std::cerr << "[BufferManager] Persisted capacities for " << capacities.size() << " indexes" << std::endl;
+    CALIBY_LOG_DEBUG("BufferManager", "Persisted capacities for ", capacities.size(), " indexes");
 }
 
 void BufferManager::evict() {
@@ -2164,29 +2151,28 @@ void BufferManager::evict() {
 
 void BufferManager::forceEvictPortion(float portion) {
     if (portion <= 0.0f || portion > 1.0f) {
-        std::cerr << "[BufferManager::forceEvictPortion] Invalid portion " << portion 
-                  << ", must be between 0.0 and 1.0" << std::endl;
+        CALIBY_LOG_WARN("BufferManager", "forceEvictPortion: Invalid portion ", portion, 
+                        ", must be between 0.0 and 1.0");
         return;
     }
     
     if (!useTraditional) {
-        std::cerr << "[BufferManager::forceEvictPortion] Only supported in traditional mode" << std::endl;
+        CALIBY_LOG_WARN("BufferManager", "forceEvictPortion: Only supported in traditional mode");
         return;
     }
     
     u64 currentUsed = physUsedCount.load(std::memory_order_relaxed);
     u64 targetEvictions = static_cast<u64>(currentUsed * portion);
     if (targetEvictions == 0) {
-        std::cerr << "[BufferManager::forceEvictPortion] No pages to evict (physUsedCount=" 
-                  << currentUsed << ")" << std::endl;
+        CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: No pages to evict (physUsedCount=", 
+                         currentUsed, ")");
         return;
     }
     
-    std::cerr << "[BufferManager::forceEvictPortion] Forcing eviction of " << targetEvictions 
-              << " pages (" << (portion * 100) << "% of " << currentUsed << " resident pages)" 
-              << std::endl;
-    std::cerr << "[BufferManager::forceEvictPortion] physCount=" << physCount 
-              << ", batch size=" << batch << std::endl;
+    CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: Forcing eviction of ", targetEvictions, 
+                     " pages (", (portion * 100), "% of ", currentUsed, " resident pages)");
+    CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: physCount=", physCount, 
+                     ", batch size=", batch);
     
     u64 evicted = 0;
     u64 iterations = 0;
@@ -2195,8 +2181,8 @@ void BufferManager::forceEvictPortion(float portion) {
     while (evicted < targetEvictions && iterations < maxIterations) {
         u64 before = physUsedCount.load(std::memory_order_relaxed);
         
-        std::cerr << "[BufferManager::forceEvictPortion] Iteration " << iterations 
-                  << ": physUsedCount=" << before << ", calling evict()..." << std::endl;
+        CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: Iteration ", iterations, 
+                         ": physUsedCount=", before, ", calling evict()...");
         
         evict();
         
@@ -2205,8 +2191,8 @@ void BufferManager::forceEvictPortion(float portion) {
         evicted += evictedThisRound;
         iterations++;
         
-        std::cerr << "[BufferManager::forceEvictPortion] Iteration " << iterations 
-                  << " complete: evicted " << evictedThisRound << " pages" << std::endl;
+        CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: Iteration ", iterations, 
+                         " complete: evicted ", evictedThisRound, " pages");
         
         if (evictedThisRound == 0) {
             // No more pages can be evicted
@@ -2214,9 +2200,9 @@ void BufferManager::forceEvictPortion(float portion) {
         }
     }
     
-    std::cerr << "[BufferManager::forceEvictPortion] Evicted " << evicted << " pages in " 
-              << iterations << " iterations" << std::endl;
-    std::cerr << "[BufferManager::forceEvictPortion] holePunchCount=" << holePunchCount.load() << std::endl;
+    CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: Evicted ", evicted, " pages in ", 
+                     iterations, " iterations");
+    CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: holePunchCount=", holePunchCount.load());
 }
 
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
@@ -3014,8 +3000,7 @@ void initialize_system() {
                     u64 current_alloc = bm_ptr->allocCount.load(std::memory_order_relaxed);
                     if (stored_alloc > current_alloc) {
                         bm_ptr->allocCount.store(stored_alloc, std::memory_order_relaxed);
-                        std::cerr << "[Calico Init] Restored allocCount from metadata: " << stored_alloc
-                                  << std::endl;
+                        CALIBY_LOG_INFO("Calico", "Restored allocCount from metadata: ", stored_alloc);
                     }
                     break;
                 } catch (const OLCRestartException&) {

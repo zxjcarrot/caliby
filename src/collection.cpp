@@ -9,6 +9,7 @@
 #include "catalog.hpp"
 #include "hnsw.hpp"
 #include "distance.hpp"
+#include "logging.hpp"
 
 #include <algorithm>
 #include <ctime>
@@ -516,7 +517,7 @@ Collection::Collection(const std::string& name,
     // Initialize collection metadata page
     save_metadata();
     
-    std::cout << "[Collection] Created collection '" << name << "' (id=" << collection_id_ << ")" << std::endl;
+    CALIBY_LOG_INFO("Collection", "Created collection '", name, "' (id=", collection_id_, ")");
 }
 
 std::unique_ptr<Collection> Collection::open(const std::string& name) {
@@ -584,17 +585,17 @@ std::unique_ptr<Collection> Collection::open(const std::string& name) {
                 collection->indices_[idx_name] = info;
                 collection->hnsw_indices_[idx_name] = std::move(hnsw);
                 
-                std::cout << "[Collection] Recovered HNSW index '" << idx_name 
-                          << "' for collection '" << name << "'" << std::endl;
+                CALIBY_LOG_INFO("Collection", "Recovered HNSW index '", idx_name, 
+                                "' for collection '", name, "'");
             }
             else if (idx_info.type == IndexType::TEXT) {
                 // Get the stored text config from catalog
                 TextTypeMetadata text_config = catalog.get_text_config(idx_info.name);
                 
-                std::cout << "[Collection] Recovery: text_config for '" << idx_info.name 
-                          << "': btree_slot=" << text_config.btree_slot_id
-                          << ", vocab=" << text_config.vocab_size
-                          << ", docs=" << text_config.doc_count << std::endl;
+                CALIBY_LOG_DEBUG("Collection", "Recovery: text_config for '", idx_info.name, 
+                                 "': btree_slot=", text_config.btree_slot_id,
+                                 ", vocab=", text_config.vocab_size,
+                                 ", docs=", text_config.doc_count);
                 
                 // Recover text index - open the handle first
                 IndexHandle idx_handle = catalog.open_index(idx_info.name);
@@ -613,11 +614,11 @@ std::unique_ptr<Collection> Collection::open(const std::string& name) {
                         text_config.k1,
                         text_config.b
                     );
-                    std::cout << "[Collection] Recovered text index from BTree slot " << text_config.btree_slot_id 
-                              << " with " << text_config.vocab_size << " terms, " 
-                              << text_config.doc_count << " docs" << std::endl;
+                    CALIBY_LOG_INFO("Collection", "Recovered text index from BTree slot ", text_config.btree_slot_id, 
+                                    " with ", text_config.vocab_size, " terms, ", 
+                                    text_config.doc_count, " docs");
                 } else {
-                    std::cout << "[Collection] No valid BTree slot for text index, rebuilding..." << std::endl;
+                    CALIBY_LOG_INFO("Collection", "No valid BTree slot for text index, rebuilding...");
                     // No valid BTree - need to rebuild from documents
                     AnalyzerType analyzer_type = AnalyzerType::STANDARD;
                     std::string analyzer_str(text_config.analyzer);
@@ -678,8 +679,8 @@ std::unique_ptr<Collection> Collection::open(const std::string& name) {
                     collection->save_text_index_state(idx_name);
                 }
                 
-                std::cout << "[Collection] Recovered text index '" << idx_name 
-                          << "' for collection '" << name << "'" << std::endl;
+                CALIBY_LOG_INFO("Collection", "Recovered text index '", idx_name, 
+                                "' for collection '", name, "'");
             }
             else if (idx_info.type == IndexType::BTREE) {
                 // Get the stored btree config from catalog
@@ -712,8 +713,8 @@ std::unique_ptr<Collection> Collection::open(const std::string& name) {
                 
                 collection->indices_[idx_name] = info;
                 
-                std::cout << "[Collection] Recovered btree index '" << idx_name 
-                          << "' for collection '" << name << "'" << std::endl;
+                CALIBY_LOG_INFO("Collection", "Recovered btree index '", idx_name, 
+                                "' for collection '", name, "'");
             }
         }
     }
@@ -965,7 +966,7 @@ void Collection::create_hnsw_index(const std::string& name, size_t M, size_t ef_
         // Index exists in catalog - this is a recovery scenario
         handle = catalog.open_index(full_name);
         recovering = true;
-        std::cout << "[Collection] Recovering HNSW index '" << name << "' from catalog" << std::endl;
+        CALIBY_LOG_INFO("Collection", "Recovering HNSW index '", name, "' from catalog");
     } else {
         // Create new index through catalog
         handle = catalog.create_hnsw_index(
@@ -1004,8 +1005,8 @@ void Collection::create_hnsw_index(const std::string& name, size_t M, size_t ef_
     // If collection already has documents with vectors, populate the index
     // (This handles the case where create_hnsw_index is called after add())
     if (!recovering && doc_count_.load() > 0 && vector_dim_ > 0) {
-        std::cout << "[Collection] Populating HNSW index '" << name 
-                  << "' with existing vectors..." << std::endl;
+        CALIBY_LOG_INFO("Collection", "Populating HNSW index '", name, 
+                        "' with existing vectors...");
         
         uint64_t populated = 0;
         uint64_t total_docs = doc_count_.load();
@@ -1038,19 +1039,18 @@ void Collection::create_hnsw_index(const std::string& name, size_t M, size_t ef_
         // Since vectors aren't stored separately, we can only populate if recovering
         // For now, warn the user that late index creation won't include existing vectors
         if (populated > 0) {
-            std::cerr << "[Collection] WARNING: HNSW index '" << name 
-                      << "' created after documents were added. "
-                      << "Vectors for existing " << populated 
-                      << " documents are NOT indexed! "
-                      << "Create the index BEFORE adding documents for best results."
-                      << std::endl;
+            CALIBY_LOG_WARN("Collection", "HNSW index '", name, 
+                           "' created after documents were added. ",
+                           "Vectors for existing ", populated, 
+                           " documents are NOT indexed! ",
+                           "Create the index BEFORE adding documents for best results.");
         }
     }
     
     if (recovering) {
-        std::cout << "[Collection] Recovered HNSW index '" << name << "' on collection '" << name_ << "'" << std::endl;
+        CALIBY_LOG_INFO("Collection", "Recovered HNSW index '", name, "' on collection '", name_, "'");
     } else {
-        std::cout << "[Collection] Created HNSW index '" << name << "' on collection '" << name_ << "'" << std::endl;
+        CALIBY_LOG_INFO("Collection", "Created HNSW index '", name, "' on collection '", name_, "'");
     }
 }
 
@@ -1082,7 +1082,7 @@ void Collection::create_diskann_index(const std::string& name, uint32_t R, uint3
     
     indices_[name] = info;
     
-    std::cout << "[Collection] Created DiskANN index '" << name << "' on collection '" << name_ << "'" << std::endl;
+    CALIBY_LOG_INFO("Collection", "Created DiskANN index '", name, "' on collection '", name_, "'");
 }
 
 void Collection::create_text_index(const std::string& name, const TextIndexConfig& config) {
@@ -1106,15 +1106,15 @@ void Collection::create_text_index(const std::string& name, const TextIndexConfi
     if (catalog.index_exists(full_name)) {
         handle = catalog.open_index(full_name);
         recovering = true;
-        std::cout << "[Collection] Recovering text index '" << name << "' from catalog" << std::endl;
+        CALIBY_LOG_INFO("Collection", "Recovering text index '", name, "' from catalog");
         
         // Get saved metadata from catalog
         TextTypeMetadata text_config = catalog.get_text_config(full_name);
         
-        std::cout << "[Collection] text_config: btree_slot=" << text_config.btree_slot_id
-                  << ", vocab=" << text_config.vocab_size
-                  << ", docs=" << text_config.doc_count
-                  << ", total_len=" << text_config.total_doc_length << std::endl;
+        CALIBY_LOG_DEBUG("Collection", "text_config: btree_slot=", text_config.btree_slot_id,
+                         ", vocab=", text_config.vocab_size,
+                         ", docs=", text_config.doc_count,
+                         ", total_len=", text_config.total_doc_length);
         
         // Check if we have a valid BTree slot ID
         if (text_config.has_valid_btree()) {
@@ -1128,9 +1128,9 @@ void Collection::create_text_index(const std::string& name, const TextIndexConfi
                 text_config.k1,
                 text_config.b
             );
-            std::cout << "[Collection] Recovered text index from BTree slot " << text_config.btree_slot_id 
-                      << " with " << text_config.vocab_size << " terms, " 
-                      << text_config.doc_count << " docs" << std::endl;
+            CALIBY_LOG_INFO("Collection", "Recovered text index from BTree slot ", text_config.btree_slot_id, 
+                            " with ", text_config.vocab_size, " terms, ", 
+                            text_config.doc_count, " docs");
         } else {
             // No valid BTree, need to rebuild from documents
             AnalyzerType analyzer_type = AnalyzerType::STANDARD;
@@ -1240,9 +1240,9 @@ void Collection::create_text_index(const std::string& name, const TextIndexConfi
     save_text_index_state(name);
     
     if (recovering) {
-        std::cout << "[Collection] Recovered text index '" << name << "' on collection '" << name_ << "'" << std::endl;
+        CALIBY_LOG_INFO("Collection", "Recovered text index '", name, "' on collection '", name_, "'");
     } else {
-        std::cout << "[Collection] Created text index '" << name << "' on collection '" << name_ << "'" << std::endl;
+        CALIBY_LOG_INFO("Collection", "Created text index '", name, "' on collection '", name_, "'");
     }
 }
 
@@ -1315,29 +1315,29 @@ void Collection::create_metadata_index(const std::string& name, const MetadataIn
     // Log index creation
     if (recovering) {
         if (config.fields.size() == 1) {
-            std::cout << "[Collection] Recovered metadata index '" << name 
-                      << "' on field '" << config.fields[0] << "'" << std::endl;
+            CALIBY_LOG_INFO("Collection", "Recovered metadata index '", name, 
+                           "' on field '", config.fields[0], "'");
         } else {
-            std::cout << "[Collection] Recovered composite metadata index '" << name 
-                      << "' on fields (";
+            std::string fields_str;
             for (size_t i = 0; i < config.fields.size(); ++i) {
-                if (i > 0) std::cout << ", ";
-                std::cout << config.fields[i];
+                if (i > 0) fields_str += ", ";
+                fields_str += config.fields[i];
             }
-            std::cout << ")" << std::endl;
+            CALIBY_LOG_INFO("Collection", "Recovered composite metadata index '", name, 
+                           "' on fields (", fields_str, ")");
         }
     } else {
         if (config.fields.size() == 1) {
-            std::cout << "[Collection] Created metadata index '" << name 
-                      << "' on field '" << config.fields[0] << "'" << std::endl;
+            CALIBY_LOG_INFO("Collection", "Created metadata index '", name, 
+                           "' on field '", config.fields[0], "'");
         } else {
-            std::cout << "[Collection] Created composite metadata index '" << name 
-                      << "' on fields (";
+            std::string fields_str;
             for (size_t i = 0; i < config.fields.size(); ++i) {
-                if (i > 0) std::cout << ", ";
-                std::cout << config.fields[i];
+                if (i > 0) fields_str += ", ";
+                fields_str += config.fields[i];
             }
-            std::cout << ")" << std::endl;
+            CALIBY_LOG_INFO("Collection", "Created composite metadata index '", name, 
+                           "' on fields (", fields_str, ")");
         }
     }
 }
@@ -1375,7 +1375,7 @@ void Collection::drop_index(const std::string& name) {
                 catalog.drop_index(full_name);
             }
         } catch (const std::exception& e) {
-            std::cerr << "[Collection] Warning: Could not drop index from catalog: " << e.what() << std::endl;
+            CALIBY_LOG_WARN("Collection", "Could not drop index from catalog: ", e.what());
         }
         
         // Remove HNSW object if present
@@ -1391,7 +1391,7 @@ void Collection::drop_index(const std::string& name) {
     
     indices_.erase(it);
     
-    std::cout << "[Collection] Dropped index '" << name << "'" << std::endl;
+    CALIBY_LOG_INFO("Collection", "Dropped index '", name, "'");
 }
 
 //=============================================================================
@@ -1745,11 +1745,10 @@ void Collection::load_metadata() {
     if (meta_page->id_index_btree_slot_id != UINT32_MAX) {
         try {
             id_index_ = std::make_unique<DocIdIndex>(meta_page->id_index_btree_slot_id);
-            std::cerr << "[Collection] Recovered DocIdIndex with BTree slotId=" 
-                      << meta_page->id_index_btree_slot_id << std::endl;
+            CALIBY_LOG_DEBUG("Collection", "Recovered DocIdIndex with BTree slotId=", 
+                             meta_page->id_index_btree_slot_id);
         } catch (const std::exception& e) {
-            std::cerr << "[Collection] Warning: Failed to recover DocIdIndex: " 
-                      << e.what() << std::endl;
+            CALIBY_LOG_WARN("Collection", "Failed to recover DocIdIndex: ", e.what());
             // Will rebuild if needed
         }
     }
@@ -1831,11 +1830,11 @@ void Collection::save_text_index_state(const std::string& index_name) {
     config.doc_count = text_index->doc_count();
     config.total_doc_length = text_index->total_doc_length();
     
-    std::cout << "[Collection] save_text_index_state '" << index_name 
-              << "': btree_slot=" << config.btree_slot_id
-              << ", vocab=" << config.vocab_size
-              << ", docs=" << config.doc_count
-              << ", total_len=" << config.total_doc_length << std::endl;
+    CALIBY_LOG_DEBUG("Collection", "save_text_index_state '", index_name, 
+                     "': btree_slot=", config.btree_slot_id,
+                     ", vocab=", config.vocab_size,
+                     ", docs=", config.doc_count,
+                     ", total_len=", config.total_doc_length);
     
     // Save back to catalog
     catalog.update_text_config(full_name, config);
@@ -2254,8 +2253,8 @@ void Collection::rebuild_id_index() {
         return;
     }
     
-    std::cerr << "[Collection] Rebuilding ID index for '" << name_ 
-              << "' (doc_count=" << doc_count << ")" << std::endl;
+    CALIBY_LOG_INFO("Collection", "Rebuilding ID index for '", name_, 
+                    "' (doc_count=", doc_count, ")");
     
     uint64_t found_docs = 0;
     constexpr size_t page_header_size = sizeof(DocumentPageHeader);
@@ -2294,13 +2293,13 @@ void Collection::rebuild_id_index() {
             current_page = page_header->next_page;
             
         } catch (const std::exception& e) {
-            std::cerr << "[Collection] Error reading page " << current_page 
-                      << " during rebuild: " << e.what() << std::endl;
+            CALIBY_LOG_ERROR("Collection", "Error reading page ", current_page, 
+                            " during rebuild: ", e.what());
             break;
         }
     }
     
-    std::cerr << "[Collection] Rebuilt ID index with " << found_docs << " documents" << std::endl;
+    CALIBY_LOG_INFO("Collection", "Rebuilt ID index with ", found_docs, " documents");
 }
 
 //=============================================================================

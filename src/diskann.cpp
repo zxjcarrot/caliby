@@ -1,4 +1,5 @@
 #include "diskann.hpp"
+#include "logging.hpp"
 
 #include <omp.h>
 
@@ -122,8 +123,7 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::DiskANN(uint64_t max_elements, size_t R_m
     _NodesPerPage = (pageSize - VamanaPage::HeaderSize) / _FixedNodeSize;
     if (_NodesPerPage == 0) throw std::runtime_error("Page size too small for node configuration.");
 
-    std::cout << "Creating new index... FixedNodeSize=" << _FixedNodeSize << ", NodesPerPage=" << _NodesPerPage
-              << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Creating new index... FixedNodeSize=", _FixedNodeSize, ", NodesPerPage=", _NodesPerPage);
     
     // Get or create PIDAllocator for this index
     uint64_t num_pages = (_max_elements + _NodesPerPage - 1) / _NodesPerPage;
@@ -545,10 +545,10 @@ template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::build_typed(const T* data, const std::vector<std::vector<TagT>>& tags,
                                                         uint64_t num_points, const BuildParams& params) {
     if (num_points > _max_elements) throw std::runtime_error("Number of points exceeds max_elements capacity.");
-    std::cout << "Starting index build for " << num_points << " points with R=" << _R_max_degree << "..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Starting index build for ", num_points, " points with R=", _R_max_degree, "...");
 
     // Phase 1: write vectors & tags
-    std::cout << "Phase 1/4: Writing vector and tag data..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Phase 1/4: Writing vector and tag data...");
     if (!_is_dynamic) {
         std::unique_lock<std::shared_mutex> lock(_map_lock);
         _internal_to_external_map.resize(num_points);
@@ -573,11 +573,11 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::build_typed(const T* data, const std
     _is_layout_optimized = false;
 
     // Phase 2: medoids
-    std::cout << "Phase 2/4: Computing medoids..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Phase 2/4: Computing medoids...");
     compute_medoids(num_points);
 
     // Phase 3: random graph init (no hash allocations)
-    std::cout << "Phase 3/4: Initializing random graph..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Phase 3/4: Initializing random graph...");
     std::mt19937 rng(1001);
     for (uint32_t i = 0; i < num_points; ++i) {
         std::vector<uint32_t> neighbors;
@@ -600,12 +600,12 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::build_typed(const T* data, const std
     }
 
     // Phase 4: Vamana refinement
-    std::cout << "Phase 4/4: Running Vamana refinement passes..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Phase 4/4: Running Vamana refinement passes...");
     std::vector<uint32_t> permutation(num_points);
     std::iota(permutation.begin(), permutation.end(), 0);
 
     auto run_pass = [&](float alpha, bool filter_aware, int pass_num) {
-        std::cout << "  - Pass " << pass_num << " with alpha=" << alpha << "..." << std::endl;
+        CALIBY_LOG_INFO("DiskANN", "  - Pass ", pass_num, " with alpha=", alpha, "...");
         std::shuffle(permutation.begin(), permutation.end(), rng);
 
         std::atomic<size_t> processed_count{0};
@@ -658,19 +658,18 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::build_typed(const T* data, const std
 
             size_t count = processed_count.fetch_add(1) + 1;
             if ((count % (num_points / 100 + 1)) == 0) {
-                std::cout << "\r    Processed " << count << "/" << num_points << " nodes." << std::flush;
+                CALIBY_LOG_DEBUG("DiskANN", "    Processed ", count, "/", num_points, " nodes.");
             }
         }
-        std::cout << std::endl;
     };
 
     run_pass(1.0f, true, 1);
     run_pass(params.alpha, true, 2);
 
-    std::cout << "Build complete." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Build complete.");
 
     optimize_layout();
-    std::cout << "Layout optimization finished. Index is ready for search." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Layout optimization finished. Index is ready for search.");
 }
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -790,7 +789,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::connect_neighbors_batched(uint32_t n
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
     if (_is_dynamic) {
-        std::cerr << "Warning: Layout optimization is intended for static indices..." << std::endl;
+        CALIBY_LOG_WARN("DiskANN", "Layout optimization is intended for static indices...");
     }
 
     uint64_t num_points = 0;
@@ -798,7 +797,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
         try {
             GuardO<DiskANNMetadataPage> meta_guard(_metadata_pid);
             if (meta_guard->is_layout_optimized) {
-                std::cout << "Layout is already optimized. Skipping." << std::endl;
+                CALIBY_LOG_INFO("DiskANN", "Layout is already optimized. Skipping.");
                 _is_layout_optimized = true;
                 return;
             }
@@ -810,10 +809,10 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
     }
     if (num_points == 0) return;
 
-    std::cout << "Starting graph layout optimization for " << num_points << " points..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Starting graph layout optimization for ", num_points, " points...");
 
     // Phase 1: BFS ordering
-    std::cout << "Phase 1/4: Calculating BFS ordering..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Phase 1/4: Calculating BFS ordering...");
     std::vector<uint32_t> new_id_to_old_id(num_points);
     std::vector<int32_t> old_id_to_new_id(num_points, -1);
     std::vector<bool> visited(num_points, false);
@@ -860,7 +859,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
     }
 
     // Phase 2: read original node blobs
-    std::cout << "Phase 2/4: Reading original index data into memory snapshot..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Phase 2/4: Reading original index data into memory snapshot...");
     std::vector<uint8_t> original_data_buffer(num_points * _FixedNodeSize);
     for (uint32_t old_id = 0; old_id < num_points; ++old_id) {
         for (;;) {
@@ -876,7 +875,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
     }
 
     // Phase 3: remap and write back
-    std::cout << "Phase 3/4: Constructing and writing final index..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Phase 3/4: Constructing and writing final index...");
     std::vector<uint8_t> temp_node_buffer(_FixedNodeSize);
     for (uint32_t new_id = 0; new_id < num_points; ++new_id) {
         uint32_t old_id_source = new_id_to_old_id[new_id];
@@ -906,7 +905,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
     }
 
     // Phase 4: update maps
-    std::cout << "Phase 4/4: Updating internal ID maps..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Phase 4/4: Updating internal ID maps...");
     {
         std::unique_lock<std::shared_mutex> lock(_map_lock);
         std::vector<uint32_t> new_internal_to_external_map(num_points);
@@ -934,7 +933,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
         meta_guard->is_layout_optimized = true;
     }
     _is_layout_optimized = true;
-    std::cout << "Layout optimization complete." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Layout optimization complete.");
 }
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -1062,7 +1061,7 @@ inline uint32_t DiskANN<T, TagT, Dim, MaxTagsPerNode>::getNodeIndexInPage(uint32
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points) {
     if (num_points == 0) return;
-    std::cout << "Computing medoids using centroid method..." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Computing medoids using centroid method...");
 
     _medoids.clear();
     _medoid_vectors_cache.clear();
@@ -1162,7 +1161,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points)
             _medoid_vectors_cache[cache_key].resize(Dim);
             if (!getNodeVector(_medoids[cache_key], _medoid_vectors_cache[cache_key].data())) {
                 _medoid_vectors_cache.erase(cache_key);
-                std::cerr << "Warning: Failed to cache vector for medoid tag " << cache_key << std::endl;
+                CALIBY_LOG_WARN("DiskANN", "Failed to cache vector for medoid tag ", cache_key);
             }
         }
     }
@@ -1175,7 +1174,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points)
         }
     }
 
-    std::cout << "Computed " << _medoids.size() << " medoids using centroid method." << std::endl;
+    CALIBY_LOG_INFO("DiskANN", "Computed ", _medoids.size(), " medoids using centroid method.");
 }
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -1199,8 +1198,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::insert_point_typed(const T* point, c
                                                                uint32_t external_id) {
     if (!_is_dynamic) throw std::runtime_error("Cannot call insert_point on a non-dynamic index.");
     if (_is_layout_optimized)
-        std::cerr << "Warning: Inserting into an optimized-layout index will degrade performance over time."
-                  << std::endl;
+        CALIBY_LOG_WARN("DiskANN", "Inserting into an optimized-layout index will degrade performance over time.");
 
     uint32_t internal_id;
     {

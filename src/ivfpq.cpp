@@ -1,4 +1,5 @@
 #include "ivfpq.hpp"
+#include "logging.hpp"
 
 #include <immintrin.h>
 #include <algorithm>
@@ -591,14 +592,12 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
     codebook_pages_per_subq_ = PQCodebookPage::pagesNeeded(IVFPQ_NUM_CODES, subvector_dim_);
     codebook_pages_ = num_subquantizers_ * codebook_pages_per_subq_;
     
-    printf("IVFPQ Initialization: Dim=%u, K=%u, M=%u, SubvecDim=%u\n",
-           dim_, num_clusters_, num_subquantizers_, subvector_dim_);
-    printf("  CentroidsPerPage=%u, CentroidPages=%u\n", centroids_per_page_, centroid_pages_);
-    printf("  EntriesPerDirPage=%u, DirPages=%u\n", entries_per_dir_page_, dir_pages_);
-    printf("  PQEntrySize=%u, EntriesPerInvListPage=%u\n", pq_entry_size_, entries_per_invlist_page_);
-    printf("  CodesPerCodebookPage=%u, CodebookPagesPerSubq=%u, TotalCodebookPages=%u\n",
-           codes_per_codebook_page_, codebook_pages_per_subq_, codebook_pages_);
-    printf("  RetrainInterval=%u\n", retrain_interval_);
+    CALIBY_LOG_INFO("IVFPQ", "Initialization: Dim=", dim_, ", K=", num_clusters_, ", M=", num_subquantizers_, ", SubvecDim=", subvector_dim_);
+    CALIBY_LOG_INFO("IVFPQ", "  CentroidsPerPage=", centroids_per_page_, ", CentroidPages=", centroid_pages_);
+    CALIBY_LOG_INFO("IVFPQ", "  EntriesPerDirPage=", entries_per_dir_page_, ", DirPages=", dir_pages_);
+    CALIBY_LOG_INFO("IVFPQ", "  PQEntrySize=", pq_entry_size_, ", EntriesPerInvListPage=", entries_per_invlist_page_);
+    CALIBY_LOG_INFO("IVFPQ", "  CodesPerCodebookPage=", codes_per_codebook_page_, ", CodebookPagesPerSubq=", codebook_pages_per_subq_, ", TotalCodebookPages=", codebook_pages_);
+    CALIBY_LOG_INFO("IVFPQ", "  RetrainInterval=", retrain_interval_);
     
     // Calculate total pages needed
     u64 total_pages = 1 + centroid_pages_ + dir_pages_ + codebook_pages_;
@@ -631,8 +630,7 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
                               meta_info->num_clusters == num_clusters_ &&
                               meta_info->num_subquantizers == num_subquantizers_;
     
-    std::cout << "[IVFPQ Recovery] skip_recovery=" << (skip_recovery ? "true" : "false")
-              << " has_existing_meta=" << (has_existing_meta ? "true" : "false") << std::endl;
+    CALIBY_LOG_INFO("IVFPQ", "Recovery: skip_recovery=", (skip_recovery ? "true" : "false"), " has_existing_meta=", (has_existing_meta ? "true" : "false"));
     
     if (!skip_recovery && params_match) {
         // Recover existing index
@@ -643,14 +641,13 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
         is_trained_.store(meta_info->is_trained != 0, std::memory_order_release);
         recovered_from_disk_ = true;
         
-        std::cout << "[IVFPQ Recovery] Recovered existing index. metadata_pid=" << metadata_pid_
-                  << " is_trained=" << is_trained_.load() << std::endl;
+        CALIBY_LOG_INFO("IVFPQ", "Recovery: Recovered existing index. metadata_pid=", metadata_pid_, " is_trained=", is_trained_.load());
     } else {
         // Initialize fresh
         if (has_existing_meta) {
             meta_info->valid = 0;
             meta_page_guard->dirty = true;
-            std::cout << "[IVFPQ Recovery] Existing metadata invalidated for rebuild" << std::endl;
+            CALIBY_LOG_INFO("IVFPQ", "Recovery: Existing metadata invalidated for rebuild");
         }
         
         // Allocate metadata page
@@ -750,31 +747,23 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
         meta_info->is_trained = 0;
         meta_page_guard->dirty = true;
         
-        std::cout << "[IVFPQ Recovery] Allocated new index. metadata_pid=" << metadata_pid_
-                  << " centroids_base=" << centroids_base_pid_
-                  << " invlist_dir_base=" << invlist_dir_base_pid_
-                  << " codebook_base=" << codebook_base_pid_ << std::endl;
+        CALIBY_LOG_INFO("IVFPQ", "Recovery: Allocated new index. metadata_pid=", metadata_pid_, " centroids_base=", centroids_base_pid_, " invlist_dir_base=", invlist_dir_base_pid_, " codebook_base=", codebook_base_pid_);
     }
     
     // Print SIMD availability info
-    std::cout << "[IVFPQ] SIMD: "
 #ifdef __AVX2__
-              << "AVX2=enabled"
+    #ifdef __AVX512F__
+    CALIBY_LOG_DEBUG("IVFPQ", "SIMD: AVX2=enabled AVX512=enabled M=", num_subquantizers_, " (SIMD search ENABLED)");
+    #else
+    CALIBY_LOG_DEBUG("IVFPQ", "SIMD: AVX2=enabled AVX512=disabled M=", num_subquantizers_, " (SIMD search ENABLED)");
+    #endif
 #else
-              << "AVX2=disabled"
+    #ifdef __AVX512F__
+    CALIBY_LOG_DEBUG("IVFPQ", "SIMD: AVX2=disabled AVX512=enabled M=", num_subquantizers_, " (SIMD search DISABLED, no AVX2)");
+    #else
+    CALIBY_LOG_DEBUG("IVFPQ", "SIMD: AVX2=disabled AVX512=disabled M=", num_subquantizers_, " (SIMD search DISABLED, no AVX2)");
+    #endif
 #endif
-#ifdef __AVX512F__
-              << " AVX512=enabled"
-#else
-              << " AVX512=disabled"
-#endif
-              << " M=" << num_subquantizers_
-#ifdef __AVX2__
-              << " (SIMD search ENABLED)"
-#else
-              << " (SIMD search DISABLED, no AVX2)"
-#endif
-              << std::endl;
 }
 
 // --- Destructor ---
@@ -1040,7 +1029,7 @@ void IVFPQ<DistanceMetric>::trainSingleCodebook(
 
 template <typename DistanceMetric>
 void IVFPQ<DistanceMetric>::trainPQCodebooks(const float* vectors, u64 n) {
-    std::cout << "[IVFPQ] Training PQ codebooks with " << n << " vectors (parallel)..." << std::endl;
+    CALIBY_LOG_INFO("IVFPQ", "Training PQ codebooks with ", n, " vectors (parallel)...");
     
     // Train all subquantizers in parallel (FAISS-style)
     std::vector<std::vector<float>> all_codebooks(num_subquantizers_);
@@ -1075,7 +1064,7 @@ void IVFPQ<DistanceMetric>::trainPQCodebooks(const float* vectors, u64 n) {
         }
     }
     
-    std::cout << "[IVFPQ] PQ codebook training complete." << std::endl;
+    CALIBY_LOG_INFO("IVFPQ", "PQ codebook training complete.");
 }
 
 // --- Train ---
@@ -1085,7 +1074,7 @@ void IVFPQ<DistanceMetric>::train(const float* training_vectors, u64 n_train, u3
         throw std::runtime_error("IVFPQ: Need at least num_clusters training vectors");
     }
     
-    std::cout << "[IVFPQ] Training with " << n_train << " vectors, " << kmeans_iters << " iterations..." << std::endl;
+    CALIBY_LOG_INFO("IVFPQ", "Training with ", n_train, " vectors, ", kmeans_iters, " iterations...");
     
     // Train coarse quantizer (cluster centroids)
     std::vector<float> centroids(num_clusters_ * dim_);
@@ -1096,7 +1085,7 @@ void IVFPQ<DistanceMetric>::train(const float* training_vectors, u64 n_train, u3
     // K-means iterations
     std::vector<u32> assignments;
     for (u32 iter = 0; iter < kmeans_iters; ++iter) {
-        std::cout << "  K-means iteration " << iter + 1 << "/" << kmeans_iters << std::endl;
+        CALIBY_LOG_DEBUG("IVFPQ", "  K-means iteration ", iter + 1, "/", kmeans_iters);
         kmeansStep(training_vectors, n_train, centroids.data(), num_clusters_, assignments);
     }
     
@@ -1157,7 +1146,7 @@ void IVFPQ<DistanceMetric>::train(const float* training_vectors, u64 n_train, u3
     // Invalidate cache
     invalidateCache();
     
-    std::cout << "[IVFPQ] Training complete." << std::endl;
+    CALIBY_LOG_INFO("IVFPQ", "Training complete.");
 }
 
 // --- Is Trained ---
@@ -1965,7 +1954,7 @@ std::vector<std::pair<float, u32>> IVFPQ<DistanceMetric>::search(
         while (current_page != BufferManager::invalidPID) {
             if (++pages_visited > MAX_PAGES) {
                 // Prevent infinite loop from corrupted page chain
-                std::cerr << "Warning: Exceeded maximum pages visited in inverted list traversal." << std::endl;
+                CALIBY_LOG_WARN("IVFPQ", "Exceeded maximum pages visited in inverted list traversal.");
                 break;
             }
             

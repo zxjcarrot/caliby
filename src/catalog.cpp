@@ -5,6 +5,7 @@
 
 #include "catalog.hpp"
 #include "calico.hpp"
+#include "logging.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -282,12 +283,12 @@ void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist
     
     // Handle cleanup if requested
     if (cleanup_if_exist && fs::exists(data_dir)) {
-        std::cout << "[IndexCatalog] Cleaning up existing directory: " << data_dir << std::endl;
+        CALIBY_LOG_INFO("IndexCatalog", "Cleaning up existing directory: ", data_dir);
         // Remove all contents but keep the directory
         for (const auto& entry : fs::directory_iterator(data_dir)) {
             fs::remove_all(entry.path());
         }
-        std::cout << "[IndexCatalog] Cleanup complete" << std::endl;
+        CALIBY_LOG_INFO("IndexCatalog", "Cleanup complete");
     }
     
     // Create data directory if it doesn't exist
@@ -319,7 +320,7 @@ void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist
         }
     }
     
-    std::cerr << "[IndexCatalog] Acquired exclusive lock on: " << data_dir << std::endl;
+    CALIBY_LOG_DEBUG("IndexCatalog", "Acquired exclusive lock on: ", data_dir);
     
     // Initialize storage (this will close any files from previous session)
     storage_.initialize(data_dir);
@@ -329,12 +330,12 @@ void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist
     bool catalog_exists = fs::exists(catalog_path);
     
     if (catalog_exists) {
-        std::cerr << "[IndexCatalog] Found existing catalog, performing recovery..." << std::endl;
+        CALIBY_LOG_INFO("IndexCatalog", "Found existing catalog, performing recovery...");
         
         // Load existing catalog
         load_catalog();
         
-        std::cerr << "[IndexCatalog] Loaded " << entries_.size() << " index entries from catalog" << std::endl;
+        CALIBY_LOG_INFO("IndexCatalog", "Loaded ", entries_.size(), " index entries from catalog");
         
         // Re-register all loaded indexes with BufferManager
         if (buffer_manager_) {
@@ -360,18 +361,18 @@ void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist
                         buffer_manager_->registerIndex(entry.index_id, initial_pages, initial_alloc_count, fd);
                         recovered++;
                         
-                        std::cerr << "[IndexCatalog] Recovered index: " << entry.name 
-                                  << " (id=" << entry.index_id << ")" << std::endl;
+                        CALIBY_LOG_DEBUG("IndexCatalog", "Recovered index: ", entry.name, 
+                                        " (id=", entry.index_id, ")");
                     } catch (const std::exception& e) {
-                        std::cerr << "[IndexCatalog] Warning: Failed to recover index " << entry.name 
-                                  << ": " << e.what() << std::endl;
+                        CALIBY_LOG_WARN("IndexCatalog", "Failed to recover index ", entry.name, 
+                                       ": ", e.what());
                     }
                 }
             }
-            std::cerr << "[IndexCatalog] Recovery complete: " << recovered << " indexes recovered" << std::endl;
+            CALIBY_LOG_INFO("IndexCatalog", "Recovery complete: ", recovered, " indexes recovered");
         }
     } else {
-        std::cerr << "[IndexCatalog] Creating new catalog in: " << data_dir << std::endl;
+        CALIBY_LOG_INFO("IndexCatalog", "Creating new catalog in: ", data_dir);
         
         // Create new catalog
         header_.initialize();
@@ -390,8 +391,8 @@ void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist
     
     initialized_.store(true);
     
-    std::cout << "[IndexCatalog] Initialized in: " << data_dir << std::endl;
-    std::cout << "[IndexCatalog] Found " << header_.num_indexes << " existing indexes" << std::endl;
+    CALIBY_LOG_INFO("IndexCatalog", "Initialized in: ", data_dir);
+    CALIBY_LOG_INFO("IndexCatalog", "Found ", header_.num_indexes, " existing indexes");
 }
 
 void IndexCatalog::shutdown() {
@@ -419,7 +420,7 @@ void IndexCatalog::shutdown() {
         fcntl(lock_fd_, F_SETLK, &fl);
         close(lock_fd_);
         lock_fd_ = -1;
-        std::cerr << "[IndexCatalog] Released directory lock" << std::endl;
+        CALIBY_LOG_DEBUG("IndexCatalog", "Released directory lock");
     }
     
     // Do NOT reset header_ here - it should persist for the saved catalog file
@@ -427,7 +428,7 @@ void IndexCatalog::shutdown() {
     
     initialized_.store(false);
     
-    std::cout << "[IndexCatalog] Shutdown complete" << std::endl;
+    CALIBY_LOG_INFO("IndexCatalog", "Shutdown complete");
 }
 
 void IndexCatalog::load_catalog() {
@@ -472,7 +473,7 @@ void IndexCatalog::load_catalog() {
         page_id++;
     }
     
-    std::cout << "[IndexCatalog] Loaded " << entries_.size() << " indexes from catalog" << std::endl;
+    CALIBY_LOG_INFO("IndexCatalog", "Loaded ", entries_.size(), " indexes from catalog");
 }
 
 void IndexCatalog::save_catalog_header() {
@@ -619,8 +620,8 @@ IndexHandle IndexCatalog::create_index(const std::string& name, IndexType type,
     save_catalog_header();
     save_index_entry(entries_.back());
     
-    std::cout << "[IndexCatalog] Created index: " << name 
-              << " (id=" << index_id << ", type=" << static_cast<int>(type) << ")" << std::endl;
+    CALIBY_LOG_INFO("IndexCatalog", "Created index: ", name, 
+                   " (id=", index_id, ", type=", static_cast<int>(type), ")");
     
     return IndexHandle(this, index_id, fd, name, type, 
                       config.dimensions, config.max_elements);
@@ -727,8 +728,7 @@ IndexHandle IndexCatalog::create_text_index(const std::string& name,
     save_catalog_header();
     save_index_entry(entries_.back());
     
-    std::cout << "[IndexCatalog] Created index: " << name 
-              << " (id=" << index_id << ", type=TEXT)" << std::endl;
+    CALIBY_LOG_INFO("IndexCatalog", "Created index: ", name, " (id=", index_id, ", type=TEXT)");
     
     return IndexHandle(this, index_id, fd, name, IndexType::TEXT, 0, 0);
 }
@@ -807,8 +807,7 @@ IndexHandle IndexCatalog::create_btree_index(const std::string& name,
     save_catalog_header();
     save_index_entry(entries_.back());
     
-    std::cout << "[IndexCatalog] Created index: " << name 
-              << " (id=" << index_id << ", type=BTREE)" << std::endl;
+    CALIBY_LOG_INFO("IndexCatalog", "Created index: ", name, " (id=", index_id, ", type=BTREE)");
     
     return IndexHandle(this, index_id, fd, name, IndexType::BTREE, 0, 0);
 }
@@ -838,8 +837,7 @@ IndexHandle IndexCatalog::open_index(const std::string& name) {
             entry->index_id, entry->file_path, false);
     }
     
-    std::cout << "[IndexCatalog] Opened index: " << name 
-              << " (id=" << entry->index_id << ")" << std::endl;
+    CALIBY_LOG_DEBUG("IndexCatalog", "Opened index: ", name, " (id=", entry->index_id, ")");
     
     return IndexHandle(const_cast<IndexCatalog*>(this), entry->index_id, fd, 
                       name, entry->index_type, entry->dimensions, entry->max_elements);
@@ -877,8 +875,7 @@ void IndexCatalog::drop_index(const std::string& name) {
             buffer_manager_->unregisterIndex(index_id);
         } catch (const std::exception& e) {
             // Log but don't throw - the index may not have been registered in Array2Level mode
-            std::cerr << "[IndexCatalog] Note: Could not unregister index from buffer manager: " 
-                      << e.what() << std::endl;
+            CALIBY_LOG_DEBUG("IndexCatalog", "Could not unregister index from buffer manager: ", e.what());
         }
     }
     
@@ -897,7 +894,7 @@ void IndexCatalog::drop_index(const std::string& name) {
     header_.num_indexes--;
     save_catalog_header();
     
-    std::cout << "[IndexCatalog] Dropped index: " << name << std::endl;
+    CALIBY_LOG_INFO("IndexCatalog", "Dropped index: ", name);
 }
 
 bool IndexCatalog::index_exists(const std::string& name) const {
@@ -1114,10 +1111,10 @@ void IndexCatalog::update_collection_config(const std::string& name, const Colle
 void IndexCatalog::update_text_config(const std::string& name, const TextTypeMetadata& config) {
     std::unique_lock lock(catalog_mutex_);
     
-    std::cout << "[IndexCatalog] update_text_config for '" << name 
-              << "': btree_slot=" << config.btree_slot_id
-              << ", vocab=" << config.vocab_size
-              << ", docs=" << config.doc_count << std::endl;
+    CALIBY_LOG_DEBUG("IndexCatalog", "update_text_config for '", name, 
+                     "': btree_slot=", config.btree_slot_id,
+                     ", vocab=", config.vocab_size,
+                     ", docs=", config.doc_count);
     
     auto it = name_to_index_id_.find(name);
     if (it == name_to_index_id_.end()) {
@@ -1165,8 +1162,8 @@ void IndexCatalog::update_index_alloc_pages(uint32_t index_id, uint64_t alloc_pa
         entry->modify_time = static_cast<uint64_t>(std::time(nullptr));
         save_index_entry(*entry);
         
-        std::cerr << "[IndexCatalog] Updated alloc_pages for index " << index_id 
-                  << " to " << alloc_pages << std::endl;
+        CALIBY_LOG_DEBUG("IndexCatalog", "Updated alloc_pages for index ", index_id, 
+                         " to ", alloc_pages);
     }
 }
 
