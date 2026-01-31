@@ -844,11 +844,16 @@ BufferManager::BufferManager(unsigned nthreads)
       pageState2Level(nullptr) {
     numThreads = nthreads;
     assert(virtSize >= physSize);
-    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "./heapfile";
-    blockfd = open(path, O_RDWR | O_DIRECT | O_CREAT, S_IRUSR | S_IWUSR);
-    if (blockfd == -1) {
-        CALIBY_LOG_ERROR("BufferManager", "cannot open BLOCK device '", path, "'");
-        exit(EXIT_FAILURE);
+    
+    // blockfd is now optional - will be -1 unless BLOCK env is explicitly set
+    // Each index uses its own file in the data directory
+    blockfd = -1;
+    const char* block_path = getenv("BLOCK");
+    if (block_path) {
+        blockfd = open(block_path, O_RDWR | O_DIRECT | O_CREAT, S_IRUSR | S_IWUSR);
+        if (blockfd == -1) {
+            CALIBY_LOG_WARN("BufferManager", "cannot open BLOCK device '", block_path, "', using per-index files only");
+        }
     }
 
     useTraditional = envOr("TRADITIONAL", 1);
@@ -1036,10 +1041,8 @@ BufferManager::BufferManager(unsigned nthreads)
     holePunchCount = 0;
     batch = envOr("BATCH", 64);
     
-    // Initialize Index Catalog
-    const char* catalog_path = getenv("CATALOG") ? getenv("CATALOG") : "./catalog.dat";
-    indexCatalog = std::make_unique<IndexCatalog>(catalog_path);
-    indexCatalog->load();  // Load persisted catalog
+    // Initialize Index Catalog - path will be set when caliby.open() is called
+    indexCatalog = std::make_unique<IndexCatalog>();
     
     // Pre-allocate PID 0 as global metadata page for index recovery
     // This ensures GuardX<MetaDataPage>(0) can access it without hanging
@@ -1055,7 +1058,7 @@ BufferManager::BufferManager(unsigned nthreads)
     translation_specialization = "hash";
     #else
     #endif
-    CALIBY_LOG_INFO("BufferManager", "Initialized: blk:", path, " virtgb:", virtSize / gb, 
+    CALIBY_LOG_INFO("BufferManager", "Initialized: virtgb:", virtSize / gb, 
                     " physgb:", (float)physSize / gb, " traditional:", useTraditional, 
                     " mmap_os_pagecache:", useMmapOSPageacche, " trad_hash:", static_cast<int>(hashMode),
                     " exmap:", useExmap, " hugepage:", (disableHugePageForFrameMem == 0),
@@ -2965,11 +2968,20 @@ void set_buffer_config(float virtgb, float physgb) {
     config_physgb = physgb;
 }
 
+// Global variable to store data directory path
+static std::string g_data_dir;
+
+void set_data_directory(const std::string& data_dir) {
+    g_data_dir = data_dir;
+}
+
+const std::string& get_data_directory() {
+    return g_data_dir;
+}
+
 void initialize_system() {
     if (bm_ptr == nullptr) {
-        // Set environment variables if they are not set, for default behavior
-        // Use config values instead of hardcoded defaults
-        setenv("BLOCK", "./heapfile", 0); // Use a different file for python tests
+        // Use config values for memory settings
         char virtgb_str[32], physgb_str[32];
         snprintf(virtgb_str, sizeof(virtgb_str), "%.2f", config_virtgb);
         snprintf(physgb_str, sizeof(physgb_str), "%.2f", config_physgb);
