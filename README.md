@@ -1,22 +1,62 @@
 # Caliby 🚀
 
-**High-Performance Embeddable Vector Database with Document Storage, Hybrid Search, and Filtering**
+**The SQLite of Vector Databases — Embeddable, Larger-Than-Memory, Zero Infrastructure**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Linux](https://img.shields.io/badge/platform-linux-lightgrey.svg)](https://www.linux.org/)
 
-Caliby is a high-performance embeddable vector database that combines document storage, semantic search, full-text search, and metadata filtering in a single library. Built on an innovative buffer pool architecture, Caliby efficiently handles datasets larger than available memory while delivering **in-memory speed when data fits in RAM** and **graceful degradation when it doesn't** — no expensive hardware or distributed systems required.
+Caliby is a **embeddable vector database** designed for AI applications that need to scale beyond available memory without the complexity of distributed systems. Unlike client-server vector databases that require separate infrastructure, Caliby runs directly inside your application for embedded use cases.
+
+## 🎯 Why Caliby?
+
+### The Problem with Existing Solutions
+
+| Solution | Limitation |
+|----------|------------|
+| **HNSWLib / Faiss / Usearch** | Memory-only — crash or slow down when data exceeds RAM |
+| **Pinecone / Weaviate / Qdrant** | Requires separate server infrastructure, network latency, operational overhead |
+| **ChromaDB / LanceDB** | Limited indexing options, no true buffer pool for efficient larger-than-memory |
+
+### Caliby's Approach: Embeddable + Fast + Larger-Than-Memory
+
+Caliby combines the **simplicity of an embedded library** with the **scalability of disk-based storage** while maintaining memory-fast vector search when data fits in memory:
+
+- **🔌 Zero Infrastructure**: `pip install caliby` — no Docker, no servers, no configuration
+- **📦 Ship with Your App**: Bundle Caliby directly into desktop apps, edge devices, or microservices
+- **💾 10M+ Vectors on a Laptop**: Handle datasets far larger than RAM with intelligent buffer management
+- **⚡ In-Memory Performance**: When data fits in RAM, matches or exceeds HNSWLib/Faiss speed
+- **📉 Graceful Degradation**: As data grows beyond RAM, performance degrades smoothly — not catastrophically
+
+### Perfect For
+
+- **🤖 AI Agents** — Persistent memory that survives restarts, scales with conversation history
+- **📱 Desktop/Mobile Apps** — Local-first semantic search without cloud dependencies  
+- **🔧 Developer Tools** — Embed code search, documentation retrieval in IDEs and CLIs
+- **🏭 Edge Computing** — Run on resource-constrained devices without network access
+- **🧪 Rapid Prototyping** — Go from idea to working RAG pipeline in minutes, not hours
 
 ## ✨ Key Features
 
+- **🔌 Truly Embeddable**: Single-process library, runs in your application's memory space
+- **💾 Larger-Than-Memory**: Innovative buffer pool handles datasets 10-100x larger than RAM
 - **📚 Document Storage**: Store vectors, text, and metadata with flexible schemas
 - **🔍 Filtered Search**: Efficient vector search with metadata filtering
 - **🔗 Hybrid Search**: Combine vector similarity and BM25 full-text search
-- **🔥 In-Memory Speed**: Matches or exceeds HNSWLib/Faiss/Usearch when data fits in RAM
-- **💾 Larger-Than-Memory**: Seamless performance with datasets exceeding available memory
-- **🎯 Multiple Index Types**: Inverted Index, B+tree, HNSW, DiskANN, and IVF+PQ algorithms
-- **🔧 Embeddable**: Single-process library, no server required
+- **🔥 In-Memory Speed**: Matches HNSWLib/Faiss when data fits in RAM
+- **🎯 Multiple Index Types**: HNSW, DiskANN, IVF+PQ, B+tree, and Inverted Index
+
+## 📱 Use Cases
+
+Caliby excels where other vector databases struggle — **embedded scenarios with large datasets**:
+
+| Use Case | Why Caliby? | Example |
+|----------|-------------|---------|
+| **🤖 Agentic Memory Store** | Persistent agent memory that grows unbounded, survives restarts, no external DB needed | [agentic_memory_store.py](examples/agentic_memory_store.py) |
+| **📚 RAG Pipeline** | Index millions of document chunks locally, hybrid search without API latency | [rag_pipeline.py](examples/rag_pipeline.py) |
+| **🛒 Recommendation System** | Ship recommendations with your app, works offline on edge devices | [recommendation_system.py](examples/recommendation_system.py) |
+| **🔍 Semantic Search** | Local-first search for desktop apps, developer tools, and offline-capable systems | [semantic_search.py](examples/semantic_search.py) |
+| **🖼️ Image Similarity** | Visual search embedded in photo apps, no cloud upload required | [image_similarity_search.py](examples/image_similarity_search.py) |
 
 ## 🚀 Quick Start
 
@@ -92,7 +132,7 @@ collection.create_hnsw_index("embedding", m=16, ef_construction=200)
 collection.create_text_index("description")
 collection.create_metadata_index("category")
 
-# Vector search with filter (99.5% recall)
+# Vector search
 query = np.random.rand(128).astype('float32')
 results = collection.search_vector("embedding", query, k=10, 
                                    filter={"category": "electronics"})
@@ -270,39 +310,6 @@ labels, distances = index.search_knn(query, k=10, nprobe=8)
 
 ## 🔧 Advanced Configuration
 
-### Multi-Index Support
-
-Create and manage multiple independent indexes with unique IDs and names:
-
-```python
-import caliby
-import numpy as np
-
-# Initialize system once
-caliby.set_buffer_config(size_gb=2.0)
-caliby.open('/tmp/caliby_data')
-
-# Create multiple indexes with unique IDs and names
-user_index = caliby.HnswIndex(
-    max_elements=100_000, dim=128, M=16, ef_construction=200,
-    enable_prefetch=True, skip_recovery=True, index_id=1, name='user_embeddings'
-)
-
-product_index = caliby.HnswIndex(
-    max_elements=200_000, dim=256, M=16, ef_construction=200,
-    enable_prefetch=True, skip_recovery=True, index_id=2, name='product_embeddings'
-)
-
-# Access index by name
-print(f"Working with: {user_index.get_name()}")
-print(f"Dimension: {user_index.get_dim()}")
-
-# Each index operates independently
-user_vectors = np.random.rand(10000, 128).astype(np.float32)
-product_vectors = np.random.rand(15000, 256).astype(np.float32)
-user_index.add_points(user_vectors, num_threads=4)
-product_index.add_points(product_vectors, num_threads=4)
-```
 ### Persistence & Recovery
 
 ```python
@@ -345,19 +352,6 @@ recovered_index = caliby.HnswIndex(
 
 if recovered_index.was_recovered():
     print("Index successfully recovered from disk!")
-```
-
-### Concurrent Access
-
-```python
-# Thread-safe by default
-from concurrent.futures import ThreadPoolExecutor
-
-def search_worker(query):
-    return index.search(query, k=10)
-
-with ThreadPoolExecutor(max_workers=8) as executor:
-    results = list(executor.map(search_worker, queries))
 ```
 
 ## 📁 Project Structure
@@ -430,6 +424,41 @@ pytest python/tests/
 - **[Collection API Guide](docs/COLLECTION_API.md)** - High-level API for documents with vectors, text, and metadata
 - **[Usage Guide](docs/USAGE.md)** - General usage patterns and examples
 - **[Benchmarks](benchmark/README.md)** - Performance comparisons and benchmarking tools
+
+## 🔬 How Caliby Handles Larger-Than-Memory
+
+Unlike in-memory libraries that crash or grind to a halt when data exceeds RAM, Caliby uses a **database-style buffer pool**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Your Application                         │
+├─────────────────────────────────────────────────────────────────┤
+│                     Caliby (Embedded Library)                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                    Buffer Pool (RAM)                     │   │
+│  │   ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐      │   │
+│  │   │Hot  │ │Hot  │ │Warm │ │Warm │ │Cold │ │Cold │ ...  │   │
+│  │   │Page │ │Page │ │Page │ │Page │ │Page │ │Page │      │   │
+│  │   └─────┘ └─────┘ └─────┘ └─────┘ └─────┘ └─────┘      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                            ▲  │                                 │
+│                   Evict    │  │ Parallel Fetch on               │
+│                   Cold     │  │ Access                          │
+│                            │  ▼                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                     Disk Storage                         │   │
+│  │        (SSD/NVMe)                                          │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Insight**: Most vector search workloads have **locality** — recently accessed vectors are likely to be accessed again. Caliby exploits this by keeping hot data in RAM and seamlessly paging cold data to disk.
+
+| Data Size vs RAM | Caliby Behavior |
+|-----------------|-----------------|
+| Data < RAM | 🚀 Full in-memory speed (matches HNSWLib) |
+| Data ≈ RAM | ⚡ Mostly in-memory, occasional disk reads |
+| Data >> RAM | 💾 Working set in memory, graceful disk access |
 
 ## 🤝 Contributing
 
