@@ -591,38 +591,69 @@ std::unique_ptr<Collection> Collection::open(const std::string& name) {
                 // Get the stored text config from catalog
                 TextTypeMetadata text_config = catalog.get_text_config(idx_info.name);
                 
-                // Determine analyzer type
-                AnalyzerType analyzer_type = AnalyzerType::STANDARD;
-                std::string analyzer_str(text_config.analyzer);
-                if (analyzer_str == "whitespace") {
-                    analyzer_type = AnalyzerType::WHITESPACE;
-                } else if (analyzer_str == "none") {
-                    analyzer_type = AnalyzerType::NONE;
-                }
+                std::cout << "[Collection] Recovery: text_config for '" << idx_info.name 
+                          << "': btree_slot=" << text_config.btree_slot_id
+                          << ", vocab=" << text_config.vocab_size
+                          << ", docs=" << text_config.doc_count << std::endl;
                 
                 // Recover text index - open the handle first
                 IndexHandle idx_handle = catalog.open_index(idx_info.name);
                 
-                // Create TextIndex object
-                auto text_index = std::make_unique<TextIndex>(
-                    collection->collection_id_,
-                    idx_handle.index_id(),
-                    analyzer_type,
-                    std::string(text_config.language),
-                    text_config.k1,
-                    text_config.b
-                );
+                std::unique_ptr<TextIndex> text_index;
                 
-                // Re-index existing documents
-                uint64_t current_doc_count = collection->doc_count_.load();
-                for (uint64_t doc_id = 1; doc_id <= current_doc_count; ++doc_id) {
-                    try {
-                        Document doc = collection->read_document(doc_id);
-                        if (!doc.content.empty()) {
-                            text_index->index_document(doc_id, doc.content);
+                // Check if we have a valid BTree slot ID (persistent state)
+                if (text_config.has_valid_btree()) {
+                    // Recover from persistent BTree
+                    text_index = TextIndex::open(
+                        idx_handle.index_id(),
+                        text_config.btree_slot_id,
+                        text_config.vocab_size,
+                        text_config.doc_count,
+                        text_config.total_doc_length,
+                        text_config.k1,
+                        text_config.b
+                    );
+                    std::cout << "[Collection] Recovered text index from BTree slot " << text_config.btree_slot_id 
+                              << " with " << text_config.vocab_size << " terms, " 
+                              << text_config.doc_count << " docs" << std::endl;
+                } else {
+                    std::cout << "[Collection] No valid BTree slot for text index, rebuilding..." << std::endl;
+                    // No valid BTree - need to rebuild from documents
+                    AnalyzerType analyzer_type = AnalyzerType::STANDARD;
+                    std::string analyzer_str(text_config.analyzer);
+                    if (analyzer_str == "whitespace") {
+                        analyzer_type = AnalyzerType::WHITESPACE;
+                    } else if (analyzer_str == "none") {
+                        analyzer_type = AnalyzerType::NONE;
+                    }
+                    
+                    text_index = std::make_unique<TextIndex>(
+                        collection->collection_id_,
+                        idx_handle.index_id(),
+                        analyzer_type,
+                        std::string(text_config.language),
+                        text_config.k1,
+                        text_config.b
+                    );
+                    
+                    // Callback to update doc length in id_index
+                    Collection* coll_ptr = collection.get();
+                    std::function<void(uint64_t, uint32_t)> update_doc_length = 
+                        [coll_ptr](uint64_t doc_id, uint32_t doc_len) {
+                            coll_ptr->id_index_update_doc_length(doc_id, doc_len);
+                        };
+                    
+                    // Re-index existing documents (doc IDs start at 0)
+                    uint64_t current_doc_count = collection->doc_count_.load();
+                    for (uint64_t doc_id = 0; doc_id < current_doc_count; ++doc_id) {
+                        try {
+                            Document doc = collection->read_document(doc_id);
+                            if (!doc.content.empty()) {
+                                text_index->index_document(doc_id, doc.content, &update_doc_length);
+                            }
+                        } catch (...) {
+                            // Document may not exist (deleted), skip
                         }
-                    } catch (...) {
-                        // Document may not exist (deleted), skip
                     }
                 }
                 
@@ -633,7 +664,7 @@ std::unique_ptr<Collection> Collection::open(const std::string& name) {
                 info.type = "text";
                 info.status = "ready";
                 info.config = {
-                    {"analyzer", analyzer_str},
+                    {"analyzer", std::string(text_config.analyzer)},
                     {"language", std::string(text_config.language)},
                     {"k1", text_config.k1},
                     {"b", text_config.b}
@@ -641,6 +672,11 @@ std::unique_ptr<Collection> Collection::open(const std::string& name) {
                 
                 collection->indices_[idx_name] = info;
                 collection->text_indices_[idx_name] = std::move(text_index);
+                
+                // Save updated BTree state if we rebuilt
+                if (text_config.btree_slot_id == 0) {
+                    collection->save_text_index_state(idx_name);
+                }
                 
                 std::cout << "[Collection] Recovered text index '" << idx_name 
                           << "' for collection '" << name << "'" << std::endl;
@@ -773,13 +809,17 @@ std::vector<uint64_t> Collection::add(const std::vector<std::string>& contents,
     // Index text content - TextIndex has its own internal locking
     {
         std::shared_lock lock(mutex_);  // Only need shared lock to read text_indices_
+        
+        // Callback to update doc length in id_index
+        std::function<void(uint64_t, uint32_t)> update_doc_length = 
+            [this](uint64_t doc_id, uint32_t doc_len) {
+                this->id_index_update_doc_length(doc_id, doc_len);
+            };
+        
         for (auto& [name, text_index] : text_indices_) {
             if (text_index) {
-                for (size_t i = 0; i < assigned_ids.size(); ++i) {
-                    if (!contents[i].empty()) {
-                        text_index->index_document(assigned_ids[i], contents[i]);
-                    }
-                }
+                // Use batch indexing for O(n) instead of O(n²)
+                text_index->index_batch(assigned_ids, contents, &update_doc_length);
             }
         }
     }
@@ -789,6 +829,7 @@ std::vector<uint64_t> Collection::add(const std::vector<std::string>& contents,
     {
         std::unique_lock lock(mutex_);
         save_metadata();
+        save_all_text_index_states();  // Persist TextIndex BTree state
     }
     
     return assigned_ids;
@@ -1059,12 +1100,56 @@ void Collection::create_text_index(const std::string& name, const TextIndexConfi
     
     IndexHandle handle;
     bool recovering = false;
+    std::unique_ptr<TextIndex> text_index;
     
     // Check if index exists in catalog (recovery case)
     if (catalog.index_exists(full_name)) {
         handle = catalog.open_index(full_name);
         recovering = true;
         std::cout << "[Collection] Recovering text index '" << name << "' from catalog" << std::endl;
+        
+        // Get saved metadata from catalog
+        TextTypeMetadata text_config = catalog.get_text_config(full_name);
+        
+        std::cout << "[Collection] text_config: btree_slot=" << text_config.btree_slot_id
+                  << ", vocab=" << text_config.vocab_size
+                  << ", docs=" << text_config.doc_count
+                  << ", total_len=" << text_config.total_doc_length << std::endl;
+        
+        // Check if we have a valid BTree slot ID
+        if (text_config.has_valid_btree()) {
+            // Recover from persistent BTree
+            text_index = TextIndex::open(
+                handle.index_id(),
+                text_config.btree_slot_id,
+                text_config.vocab_size,
+                text_config.doc_count,
+                text_config.total_doc_length,
+                text_config.k1,
+                text_config.b
+            );
+            std::cout << "[Collection] Recovered text index from BTree slot " << text_config.btree_slot_id 
+                      << " with " << text_config.vocab_size << " terms, " 
+                      << text_config.doc_count << " docs" << std::endl;
+        } else {
+            // No valid BTree, need to rebuild from documents
+            AnalyzerType analyzer_type = AnalyzerType::STANDARD;
+            std::string analyzer_str(text_config.analyzer);
+            if (analyzer_str == "whitespace") {
+                analyzer_type = AnalyzerType::WHITESPACE;
+            } else if (analyzer_str == "none") {
+                analyzer_type = AnalyzerType::NONE;
+            }
+            
+            text_index = std::make_unique<TextIndex>(
+                collection_id_,
+                handle.index_id(),
+                analyzer_type,
+                std::string(text_config.language),
+                text_config.k1,
+                text_config.b
+            );
+        }
     } else {
         // Create new index through catalog
         handle = catalog.create_text_index(
@@ -1074,43 +1159,65 @@ void Collection::create_text_index(const std::string& name, const TextIndexConfi
             config.k1,
             config.b
         );
-    }
-    
-    // Determine analyzer type
-    AnalyzerType analyzer_type = AnalyzerType::STANDARD;
-    if (config.analyzer == "whitespace") {
-        analyzer_type = AnalyzerType::WHITESPACE;
-    } else if (config.analyzer == "none") {
-        analyzer_type = AnalyzerType::NONE;
-    }
-    
-    // Create actual TextIndex object
-    auto text_index = std::make_unique<TextIndex>(
-        collection_id_,
-        handle.index_id(),
-        analyzer_type,
-        config.language,
-        config.k1,
-        config.b
-    );
-    
-    // Index existing documents (for both new and recovered indexes)
-    // We need to release the lock temporarily to call read_document
-    uint64_t current_doc_count = doc_count_.load();
-    lock.unlock();
-    
-    for (uint64_t doc_id = 1; doc_id <= current_doc_count; ++doc_id) {
-        try {
-            Document doc = read_document(doc_id);
-            if (!doc.content.empty()) {
-                text_index->index_document(doc_id, doc.content);
-            }
-        } catch (...) {
-            // Document may not exist (deleted), skip
+        
+        // Determine analyzer type
+        AnalyzerType analyzer_type = AnalyzerType::STANDARD;
+        if (config.analyzer == "whitespace") {
+            analyzer_type = AnalyzerType::WHITESPACE;
+        } else if (config.analyzer == "none") {
+            analyzer_type = AnalyzerType::NONE;
         }
+        
+        // Create new TextIndex object
+        text_index = std::make_unique<TextIndex>(
+            collection_id_,
+            handle.index_id(),
+            analyzer_type,
+            config.language,
+            config.k1,
+            config.b
+        );
     }
     
-    lock.lock();
+    // If we don't have data from recovery, index existing documents
+    bool need_reindex = !recovering || text_index->doc_count() == 0;
+    
+    if (need_reindex) {
+        uint64_t current_doc_count = doc_count_.load();
+        lock.unlock();
+        
+        // Collect all documents for batch indexing (much faster than one-by-one)
+        std::vector<uint64_t> doc_ids;
+        std::vector<std::string> contents;
+        doc_ids.reserve(current_doc_count);
+        contents.reserve(current_doc_count);
+        
+        // Document IDs start at 0
+        for (uint64_t doc_id = 0; doc_id < current_doc_count; ++doc_id) {
+            try {
+                Document doc = read_document(doc_id);
+                if (!doc.content.empty()) {
+                    doc_ids.push_back(doc_id);
+                    contents.push_back(std::move(doc.content));
+                }
+            } catch (...) {
+                // Document may not exist (deleted), skip
+            }
+        }
+        
+        // Callback to update doc length in id_index
+        std::function<void(uint64_t, uint32_t)> update_doc_length = 
+            [this](uint64_t doc_id, uint32_t doc_len) {
+                this->id_index_update_doc_length(doc_id, doc_len);
+            };
+        
+        // Batch index all documents at once
+        if (!doc_ids.empty()) {
+            text_index->index_batch(doc_ids, contents, &update_doc_length);
+        }
+        
+        lock.lock();
+    }
     
     // Track the index info
     CollectionIndexInfo info;
@@ -1128,6 +1235,9 @@ void Collection::create_text_index(const std::string& name, const TextIndexConfi
     
     indices_[name] = info;
     text_indices_[name] = std::move(text_index);
+    
+    // Save BTree state to catalog for persistence
+    save_text_index_state(name);
     
     if (recovering) {
         std::cout << "[Collection] Recovered text index '" << name << "' on collection '" << name_ << "'" << std::endl;
@@ -1455,8 +1565,14 @@ std::vector<SearchResult> Collection::search_text(
         doc_filter_ptr = &doc_filter_vec;
     }
     
+    // Callback to get doc length from id_index for BM25 scoring
+    std::function<uint32_t(uint64_t)> get_doc_length = 
+        [this](uint64_t doc_id) -> uint32_t {
+            return this->id_index_get_doc_length(doc_id);
+        };
+    
     // Perform BM25 search
-    auto text_results = text_index->search(text, k, doc_filter_ptr);
+    auto text_results = text_index->search(text, k, doc_filter_ptr, &get_doc_length);
     
     // Convert to SearchResult format
     for (const auto& [doc_id, score] : text_results) {
@@ -1693,6 +1809,44 @@ void Collection::save_metadata() {
     }
     
     // GuardX destructor will unlock the page, keeping dirty=true
+}
+
+void Collection::save_text_index_state(const std::string& index_name) {
+    auto it = text_indices_.find(index_name);
+    if (it == text_indices_.end() || !it->second) {
+        return;
+    }
+    
+    TextIndex* text_index = it->second.get();
+    std::string full_name = name_ + "_" + index_name;
+    
+    IndexCatalog& catalog = IndexCatalog::instance();
+    
+    // Get existing config
+    TextTypeMetadata config = catalog.get_text_config(full_name);
+    
+    // Update with current BTree state
+    config.btree_slot_id = text_index->btree_slot_id();
+    config.vocab_size = text_index->vocab_size();
+    config.doc_count = text_index->doc_count();
+    config.total_doc_length = text_index->total_doc_length();
+    
+    std::cout << "[Collection] save_text_index_state '" << index_name 
+              << "': btree_slot=" << config.btree_slot_id
+              << ", vocab=" << config.vocab_size
+              << ", docs=" << config.doc_count
+              << ", total_len=" << config.total_doc_length << std::endl;
+    
+    // Save back to catalog
+    catalog.update_text_config(full_name, config);
+}
+
+void Collection::save_all_text_index_states() {
+    for (const auto& [name, text_index] : text_indices_) {
+        if (text_index) {
+            save_text_index_state(name);
+        }
+    }
 }
 
 PID Collection::allocate_page() {
@@ -2046,14 +2200,25 @@ void Collection::delete_document_internal(uint64_t doc_id) {
 // ID Index Methods (Persistent B-tree index)
 //=============================================================================
 
-// The ID index maps document IDs to (page_id, slot) locations.
+// The ID index maps document IDs to (page_id, slot, doc_length) locations.
 // Uses persistent B-tree for durability and efficient lookups.
 
-void Collection::id_index_insert(uint64_t doc_id, PID page_id, uint16_t slot) {
+void Collection::id_index_insert(uint64_t doc_id, PID page_id, uint16_t slot, uint32_t doc_length) {
     if (!id_index_) {
         id_index_ = std::make_unique<DocIdIndex>();
     }
-    id_index_->insert(doc_id, DocIdIndex::DocLocation(page_id, slot));
+    id_index_->insert(doc_id, DocIdIndex::DocLocation(page_id, slot, doc_length));
+}
+
+void Collection::id_index_update_doc_length(uint64_t doc_id, uint32_t doc_length) {
+    if (!id_index_) {
+        return;
+    }
+    auto loc = id_index_->lookup(doc_id);
+    if (loc) {
+        // Update with new doc_length
+        id_index_->update(doc_id, DocIdIndex::DocLocation(loc->page_id, loc->slot, doc_length));
+    }
 }
 
 std::optional<std::pair<PID, uint16_t>> Collection::id_index_lookup(uint64_t doc_id) {
@@ -2071,6 +2236,13 @@ void Collection::id_index_remove(uint64_t doc_id) {
     if (id_index_) {
         id_index_->remove(doc_id);
     }
+}
+
+uint32_t Collection::id_index_get_doc_length(uint64_t doc_id) const {
+    if (!id_index_) {
+        return 0;
+    }
+    return id_index_->get_doc_length(doc_id);
 }
 
 void Collection::rebuild_id_index() {

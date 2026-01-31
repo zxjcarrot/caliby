@@ -865,14 +865,19 @@ void DocIdIndex::insert(uint64_t doc_id, const DocLocation& location) {
         key[7 - i] = static_cast<uint8_t>((doc_id >> (i * 8)) & 0xFF);
     }
     
-    // Serialize location as payload
-    uint8_t payload[sizeof(PID) + sizeof(uint16_t)];
+    // Serialize location as payload: page_id (8 bytes) + slot (2 bytes) + doc_length (4 bytes)
+    uint8_t payload[sizeof(PID) + sizeof(uint16_t) + sizeof(uint32_t)];
     uint64_t pid = location.page_id;
     for (int i = 7; i >= 0; --i) {
         payload[7 - i] = static_cast<uint8_t>((pid >> (i * 8)) & 0xFF);
     }
     payload[8] = static_cast<uint8_t>((location.slot >> 8) & 0xFF);
     payload[9] = static_cast<uint8_t>(location.slot & 0xFF);
+    // doc_length in big-endian
+    payload[10] = static_cast<uint8_t>((location.doc_length >> 24) & 0xFF);
+    payload[11] = static_cast<uint8_t>((location.doc_length >> 16) & 0xFF);
+    payload[12] = static_cast<uint8_t>((location.doc_length >> 8) & 0xFF);
+    payload[13] = static_cast<uint8_t>(location.doc_length & 0xFF);
     
     btree_->insert(
         std::span<uint8_t>(key, sizeof(key)),
@@ -890,7 +895,7 @@ std::optional<DocIdIndex::DocLocation> DocIdIndex::lookup(uint64_t doc_id) const
         key[7 - i] = static_cast<uint8_t>((doc_id >> (i * 8)) & 0xFF);
     }
     
-    uint8_t payload[sizeof(PID) + sizeof(uint16_t)];
+    uint8_t payload[sizeof(PID) + sizeof(uint16_t) + sizeof(uint32_t)];
     int len = btree_->lookup(
         std::span<uint8_t>(key, sizeof(key)),
         payload, sizeof(payload)
@@ -907,7 +912,16 @@ std::optional<DocIdIndex::DocLocation> DocIdIndex::lookup(uint64_t doc_id) const
     }
     uint16_t slot = (static_cast<uint16_t>(payload[8]) << 8) | payload[9];
     
-    return DocLocation{pid, slot};
+    // Deserialize doc_length (handle old format without doc_length)
+    uint32_t doc_length = 0;
+    if (len >= 14) {
+        doc_length = (static_cast<uint32_t>(payload[10]) << 24) |
+                     (static_cast<uint32_t>(payload[11]) << 16) |
+                     (static_cast<uint32_t>(payload[12]) << 8) |
+                     static_cast<uint32_t>(payload[13]);
+    }
+    
+    return DocLocation{pid, slot, doc_length};
 }
 
 void DocIdIndex::update(uint64_t doc_id, const DocLocation& location) {
@@ -924,13 +938,19 @@ void DocIdIndex::update(uint64_t doc_id, const DocLocation& location) {
         key[7 - i] = static_cast<uint8_t>((doc_id >> (i * 8)) & 0xFF);
     }
     
-    uint8_t payload[sizeof(PID) + sizeof(uint16_t)];
+    // Serialize location as payload: page_id (8 bytes) + slot (2 bytes) + doc_length (4 bytes)
+    uint8_t payload[sizeof(PID) + sizeof(uint16_t) + sizeof(uint32_t)];
     uint64_t pid = location.page_id;
     for (int i = 7; i >= 0; --i) {
         payload[7 - i] = static_cast<uint8_t>((pid >> (i * 8)) & 0xFF);
     }
     payload[8] = static_cast<uint8_t>((location.slot >> 8) & 0xFF);
     payload[9] = static_cast<uint8_t>(location.slot & 0xFF);
+    // doc_length in big-endian
+    payload[10] = static_cast<uint8_t>((location.doc_length >> 24) & 0xFF);
+    payload[11] = static_cast<uint8_t>((location.doc_length >> 16) & 0xFF);
+    payload[12] = static_cast<uint8_t>((location.doc_length >> 8) & 0xFF);
+    payload[13] = static_cast<uint8_t>(location.doc_length & 0xFF);
     
     btree_->insert(
         std::span<uint8_t>(key, sizeof(key)),
@@ -955,6 +975,11 @@ bool DocIdIndex::remove(uint64_t doc_id) {
 
 bool DocIdIndex::contains(uint64_t doc_id) const {
     return lookup(doc_id).has_value();
+}
+
+uint32_t DocIdIndex::get_doc_length(uint64_t doc_id) const {
+    auto loc = lookup(doc_id);
+    return loc ? loc->doc_length : 0;
 }
 
 } // namespace caliby

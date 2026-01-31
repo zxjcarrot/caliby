@@ -1111,6 +1111,40 @@ void IndexCatalog::update_collection_config(const std::string& name, const Colle
     save_index_entry(*entry);
 }
 
+void IndexCatalog::update_text_config(const std::string& name, const TextTypeMetadata& config) {
+    std::unique_lock lock(catalog_mutex_);
+    
+    std::cout << "[IndexCatalog] update_text_config for '" << name 
+              << "': btree_slot=" << config.btree_slot_id
+              << ", vocab=" << config.vocab_size
+              << ", docs=" << config.doc_count << std::endl;
+    
+    auto it = name_to_index_id_.find(name);
+    if (it == name_to_index_id_.end()) {
+        throw std::runtime_error("Text index not found: " + name);
+    }
+    
+    IndexEntry* entry = nullptr;
+    for (auto& e : entries_) {
+        if (e.index_id == it->second) {
+            entry = &e;
+            break;
+        }
+    }
+    
+    if (!entry) {
+        throw std::runtime_error("Text index entry not found: " + name);
+    }
+    
+    if (entry->index_type != IndexType::TEXT) {
+        throw std::runtime_error("Entry is not TEXT type: " + name);
+    }
+    
+    std::memcpy(entry->type_metadata, &config, sizeof(TextTypeMetadata));
+    entry->modify_time = static_cast<uint64_t>(std::time(nullptr));
+    save_index_entry(*entry);
+}
+
 void IndexCatalog::update_index_element_count(uint32_t index_id, uint64_t count) {
     std::unique_lock lock(catalog_mutex_);
     

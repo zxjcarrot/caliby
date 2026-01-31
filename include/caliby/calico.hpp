@@ -1733,6 +1733,45 @@ struct BTree {
         }
     }
 
+    /**
+     * Update a key's payload out-of-place (delete + insert).
+     * Returns: 0 = success, -1 = key not found, -2 = no space in leaf for new payload
+     * This is useful when the new payload size differs from the old one.
+     */
+    int updateOutOfPlace(std::span<u8> key, std::span<u8> newPayload) {
+        // First check if key exists and if we have space
+        for (u64 repeatCounter = 0;; repeatCounter++) {
+            try {
+                GuardO<BTreeNode> node = findLeafO(key);
+                bool found;
+                unsigned pos = node->lowerBound(key, found);
+                if (!found) return -1;  // Key not found
+                
+                // Calculate space needed for new entry vs freed space from old entry
+                unsigned oldKeyLen = node->slot[pos].keyLen + node->prefixLen;
+                unsigned oldPayloadLen = node->slot[pos].payloadLen;
+                unsigned oldSpaceUsed = sizeof(BTreeNode::Slot) + node->slot[pos].keyLen + oldPayloadLen;
+                unsigned newSpaceNeeded = node->spaceNeeded(key.size(), newPayload.size());
+                
+                // Check if after deletion we have space for the new entry
+                unsigned freeAfterDelete = node->freeSpaceAfterCompaction() + oldSpaceUsed;
+                if (freeAfterDelete < newSpaceNeeded) {
+                    return -2;  // No space even after deletion
+                }
+                
+                // Acquire write lock and perform delete + insert atomically
+                {
+                    GuardX<BTreeNode> nodeLocked(std::move(node));
+                    nodeLocked->removeSlot(pos);
+                    nodeLocked->insertInPage(key, newPayload);
+                    return 0;  // Success
+                }
+            } catch (const OLCRestartException&) {
+                yield(repeatCounter);
+            }
+        }
+    }
+
     template <class Fn>
     void scanAsc(std::span<u8> key, Fn fn) {
         GuardS<BTreeNode> node = findLeafS(key);

@@ -73,7 +73,6 @@ except ImportError:
     print("Warning: weaviate not available (install: pip install weaviate-client)")
     LIBS_AVAILABLE['weaviate'] = False
 
-
 @dataclass
 class BenchmarkResult:
     """Results from a single benchmark run."""
@@ -1656,33 +1655,40 @@ def main():
     
     results = []
     
-    if not args.caliby_only and not args.chromadb_only and not args.qdrant_only and LIBS_AVAILABLE['weaviate']:
+    # Determine which benchmarks to skip based on --*-only flags
+    only_flags = [args.caliby_only, args.chromadb_only, args.qdrant_only, args.weaviate_only]
+    run_all = not any(only_flags)
+    
+    # Run Weaviate benchmark
+    if (run_all or args.weaviate_only) and LIBS_AVAILABLE.get('weaviate', False):
         result = benchmark_weaviate(base_vectors, query_vectors, groundtruth, params)
         if result:
             results.append(result)
-    elif not args.caliby_only and not args.chromadb_only and not args.qdrant_only:
+    elif args.weaviate_only:
         print("Weaviate not available, skipping...")
     
-    # Run benchmarks
-    if not args.chromadb_only and not args.qdrant_only and not args.weaviate_only and LIBS_AVAILABLE['caliby']:
+    # Run Caliby benchmark
+    if (run_all or args.caliby_only) and LIBS_AVAILABLE.get('caliby', False):
         result = benchmark_caliby(base_vectors, query_vectors, groundtruth, params)
         if result:
             results.append(result)
-    elif not args.chromadb_only and not args.qdrant_only and not args.weaviate_only:
+    elif args.caliby_only:
         print("Caliby not available, skipping...")
     
-    if not args.caliby_only and not args.qdrant_only and not args.weaviate_only and LIBS_AVAILABLE['chromadb']:
+    # Run ChromaDB benchmark
+    if (run_all or args.chromadb_only) and LIBS_AVAILABLE.get('chromadb', False):
         result = benchmark_chromadb(base_vectors, query_vectors, groundtruth, params)
         if result:
             results.append(result)
-    elif not args.caliby_only and not args.qdrant_only and not args.weaviate_only:
+    elif args.chromadb_only:
         print("ChromaDB not available, skipping...")
     
-    # if not args.caliby_only and not args.chromadb_only and not args.weaviate_only and LIBS_AVAILABLE['qdrant']:
+    # Run Qdrant benchmark (commented out)
+    # if (run_all or args.qdrant_only) and LIBS_AVAILABLE.get('qdrant', False):
     #     result = benchmark_qdrant(base_vectors, query_vectors, groundtruth, params)
     #     if result:
     #         results.append(result)
-    # elif not args.caliby_only and not args.chromadb_only and not args.weaviate_only:
+    # elif args.qdrant_only:
     #     print("Qdrant not available, skipping...")
     
     

@@ -73,12 +73,23 @@ static_assert(sizeof(HnswTypeMetadata) == TYPE_METADATA_SIZE, "HnswTypeMetadata 
 struct TextTypeMetadata {
     static constexpr size_t MAX_ANALYZER_LEN = 32;
     static constexpr size_t MAX_LANGUAGE_LEN = 32;
+    static constexpr uint32_t INVALID_BTREE_SLOT = UINT32_MAX;  // Sentinel for uninitialized
     
-    char analyzer[MAX_ANALYZER_LEN];   // "standard", "whitespace", "none"
-    char language[MAX_LANGUAGE_LEN];   // For stemming/stopwords
-    float k1;                          // BM25 k1 parameter
-    float b;                           // BM25 b parameter
-    uint8_t reserved[256 - MAX_ANALYZER_LEN - MAX_LANGUAGE_LEN - 8];
+    char analyzer[MAX_ANALYZER_LEN];   // "standard", "whitespace", "none"  (32 bytes)
+    char language[MAX_LANGUAGE_LEN];   // For stemming/stopwords            (32 bytes)
+    float k1;                          // BM25 k1 parameter                 (4 bytes)
+    float b;                           // BM25 b parameter                  (4 bytes)
+    
+    // Persistent BTree state for text index recovery
+    uint32_t btree_slot_id;            // BTree slot ID for term dictionary (4 bytes)
+    uint32_t reserved_padding;         // Alignment padding                 (4 bytes)
+    uint64_t vocab_size;               // Number of unique terms            (8 bytes)
+    uint64_t doc_count;                // Number of indexed documents       (8 bytes)
+    uint64_t total_doc_length;         // Total of all document lengths     (8 bytes)
+    
+    // Total used: 32 + 32 + 4 + 4 + 4 + 4 + 8 + 8 + 8 = 104 bytes
+    // Reserved: 256 - 104 = 152 bytes
+    uint8_t reserved[152];
     
     void initialize(const std::string& ana, const std::string& lang, float k1_val, float b_val) {
         std::memset(this, 0, sizeof(*this));
@@ -86,6 +97,15 @@ struct TextTypeMetadata {
         std::strncpy(language, lang.c_str(), MAX_LANGUAGE_LEN - 1);
         k1 = k1_val;
         b = b_val;
+        btree_slot_id = INVALID_BTREE_SLOT;  // Not initialized
+        reserved_padding = 0;
+        vocab_size = 0;
+        doc_count = 0;
+        total_doc_length = 0;
+    }
+    
+    bool has_valid_btree() const {
+        return btree_slot_id != INVALID_BTREE_SLOT;
     }
 };
 static_assert(sizeof(TextTypeMetadata) == TYPE_METADATA_SIZE, "TextTypeMetadata must match TYPE_METADATA_SIZE");
@@ -637,6 +657,11 @@ public:
      * Get Text index config (only valid for TEXT type indices).
      */
     TextTypeMetadata get_text_config(const std::string& name) const;
+    
+    /**
+     * Update Text index config (e.g., BTree slot ID, vocab size).
+     */
+    void update_text_config(const std::string& name, const TextTypeMetadata& config);
     
     /**
      * Get BTree index config (only valid for BTREE type indices).
