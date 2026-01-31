@@ -38,7 +38,7 @@ Caliby combines the **simplicity of an embedded library** with the **scalability
 
 ## ✨ Key Features
 
-- **🔌 Truly Embeddable**: Single-process library, runs in your application's memory space
+- **🔌 Embeddable**: Single-process library, runs in your application's memory space
 - **💾 Larger-Than-Memory**: Innovative buffer pool handles datasets 10-100x larger than RAM
 - **📚 Document Storage**: Store vectors, text, and metadata with flexible schemas
 - **🔍 Filtered Search**: Efficient vector search with metadata filtering
