@@ -79,6 +79,8 @@ void initialize_system();
 void shutdown_system();
 void flush_system();
 void set_buffer_config(float virtgb, float physgb);
+void set_data_directory(const std::string& data_dir);
+const std::string& get_data_directory();
 
 // --- Automatic Initializer ---
 // NOTE: Auto-initialization is disabled to allow set_buffer_config() to be called first.
@@ -139,13 +141,24 @@ PYBIND11_MODULE(caliby, m) {
         // Reset system closed flag - system is being (re)opened
         system_closed = false;
         
+        // Store data directory for later use
+        set_data_directory(data_dir);
+        
         // Initialize the buffer manager and catalog with the specified directory
         initialize_system();
         
-        // If cleanup_if_exist, also clear the simple IndexCatalog to prevent stale data
-        // from being used when creating new indexes with explicit index_ids
-        if (cleanup_if_exist && bm_ptr && bm_ptr->indexCatalog) {
-            bm_ptr->indexCatalog->clear();
+        // Set the path for the simple IndexCatalog (stores in data directory)
+        if (bm_ptr && bm_ptr->indexCatalog) {
+            std::string simple_catalog_path = data_dir + "/caliby_simple_catalog.dat";
+            bm_ptr->indexCatalog->setPath(simple_catalog_path);
+            
+            if (cleanup_if_exist) {
+                // Clear entries and don't load old data
+                bm_ptr->indexCatalog->clear();
+            } else {
+                // Load existing catalog from data directory
+                bm_ptr->indexCatalog->load();
+            }
         }
         
         // Connect catalog to buffer manager for proper index registration

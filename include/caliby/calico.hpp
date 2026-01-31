@@ -641,6 +641,17 @@ struct IndexCatalog {
     
     // Clear all entries (for cleanup on reinitialization)
     void clear();
+    
+    // Set the catalog file path (for use with data directory)
+    void setPath(const std::string& path) {
+        std::unique_lock<std::shared_mutex> lock(mutex);
+        catalog_file_path = path;
+    }
+    
+    // Get the catalog file path
+    const std::string& getPath() const {
+        return catalog_file_path;
+    }
 };
 
 struct BufferManager {
