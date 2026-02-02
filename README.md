@@ -6,7 +6,7 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Linux](https://img.shields.io/badge/platform-linux-lightgrey.svg)](https://www.linux.org/)
 
-Caliby is a **embeddable vector database** designed for AI applications that need to scale beyond available memory without the complexity of distributed systems. Unlike client-server vector databases that require separate infrastructure, Caliby runs directly inside your application for embedded use cases with rich features including document storage, vector search, and filtered search.
+Caliby is an **embeddable vector database** designed for AI applications that need to scale beyond available memory without the complexity of distributed systems. Unlike client-server vector databases that require separate infrastructure, Caliby runs directly inside your application for embedded use cases with rich features including document storage, vector search, and filtered search.
 
 ## 🎯 Why Caliby?
 
