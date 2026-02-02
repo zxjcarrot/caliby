@@ -60,25 +60,6 @@ Caliby excels where other vector databases struggle — **embedded scenarios wit
 
 ## 🚀 Quick Start
 
-### Prerequisites
-
-Caliby requires the following system dependencies:
-- C++17 compatible compiler (GCC 9+ or Clang 10+)
-- CMake 3.15+
-- OpenMP
-- Abseil C++ library
-- Python 3.8+
-
-**Ubuntu/Debian:**
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential cmake libomp-dev libabsl-dev python3-dev
-```
-
-**Fedora/RHEL:**
-```bash
-sudo dnf install -y gcc-c++ cmake libomp-devel abseil-cpp-devel python3-devel
-```
 
 ### Installation
 
@@ -381,18 +362,22 @@ caliby/
 
 ### Prerequisites
 
-- Linux (Ubuntu 20.04+ recommended)
-- GCC 10+ or Clang 12+
-- CMake 3.16+
-- Python 3.8+ with development headers
-- libaio-dev
+Caliby requires the following system dependencies:
+- C++17 compatible compiler (GCC 9+ or Clang 10+)
+- CMake 3.15+
+- OpenMP
+- Abseil C++ library
+- Python 3.8+
 
+**Ubuntu/Debian:**
 ```bash
-# Ubuntu/Debian
-sudo apt-get install build-essential cmake python3-dev libaio-dev
+sudo apt-get update
+sudo apt-get install -y build-essential cmake libomp-dev libabsl-dev python3-dev
+```
 
-# Enable huge pages (recommended for performance)
-sudo sysctl -w vm.nr_hugepages=1024
+**Fedora/RHEL:**
+```bash
+sudo dnf install -y gcc-c++ cmake libomp-devel abseil-cpp-devel python3-devel
 ```
 
 ### Build
