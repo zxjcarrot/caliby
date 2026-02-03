@@ -141,6 +141,21 @@ int IndexCatalog::getFileFd(u32 index_id) const {
 void IndexCatalog::persist() {
     std::shared_lock<std::shared_mutex> lock(mutex);
     
+    // Check if catalog file path is set
+    if (catalog_file_path.empty()) {
+        return;  // Nothing to persist
+    }
+    
+    // Check if the parent directory still exists (may have been deleted during cleanup)
+    std::string parent_dir = catalog_file_path.substr(0, catalog_file_path.find_last_of('/'));
+    struct stat st;
+    if (!parent_dir.empty() && stat(parent_dir.c_str(), &st) != 0) {
+        // Directory no longer exists, skip persistence silently
+        CALIBY_LOG_DEBUG("IndexCatalog", "Skipping persist - directory no longer exists: ", 
+                         parent_dir);
+        return;
+    }
+    
     std::ofstream ofs(catalog_file_path, std::ios::binary | std::ios::trunc);
     if (!ofs) {
         CALIBY_LOG_ERROR("IndexCatalog", "Failed to open catalog file for writing: ", 

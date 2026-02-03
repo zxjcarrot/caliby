@@ -357,6 +357,11 @@ public:
     virtual std::vector<std::pair<float, uint32_t>> searchKnn(
         const float* query, size_t k, size_t ef_search = 100) = 0;
     
+    // Compute distances from query to specific candidate IDs (for pre-filtering)
+    // Returns vector of (distance, node_id) pairs sorted by distance
+    virtual std::vector<std::pair<float, uint32_t>> computeDistances(
+        const float* query, const std::vector<uint64_t>& candidate_ids, size_t k) = 0;
+    
     // Get distance metric type
     virtual DistanceMetric metric() const = 0;
     
@@ -771,6 +776,10 @@ private:
     // Text indices (keyed by index name)
     std::unordered_map<std::string, std::unique_ptr<TextIndex>> text_indices_;
     
+    // Metadata B-tree indices (keyed by index name)
+    // Used for fast filter evaluation on indexed fields
+    std::unordered_map<std::string, std::unique_ptr<BTreeMetadataIndex>> btree_indices_;
+    
     // Internal methods
     void load_metadata();
     void save_metadata();
@@ -797,6 +806,12 @@ private:
     // Filtered search helpers
     std::vector<uint64_t> evaluate_filter(const FilterCondition& filter);
     float estimate_selectivity(const FilterCondition& filter);
+    
+    // Find btree index for a field (returns nullptr if none)
+    BTreeMetadataIndex* find_btree_index_for_field(const std::string& field_name) const;
+    
+    // Index btree indices when adding/updating documents
+    void update_btree_indices_for_document(uint64_t doc_id, const nlohmann::json& metadata, bool is_delete = false);
 };
 
 } // namespace caliby

@@ -54,6 +54,11 @@ public:
         return hnsw_.searchKnn(query, k, ef_search);
     }
     
+    std::vector<std::pair<float, uint32_t>> computeDistances(
+        const float* query, const std::vector<uint64_t>& candidate_ids, size_t k) override {
+        return hnsw_.computeDistancesToCandidates(query, candidate_ids, k);
+    }
+    
     DistanceMetric metric() const override {
         return metric_type_;
     }
@@ -243,6 +248,77 @@ FieldType get_field_type(const MetadataValue& value) {
         else if constexpr (std::is_same_v<T, std::vector<int64_t>>) return FieldType::INT_ARRAY;
         else return FieldType::STRING;
     }, value);
+}
+
+/**
+ * Convert FieldType to BTreeKeyType for indexing.
+ * Only scalar types can be indexed.
+ */
+BTreeKeyType field_type_to_btree_key_type(FieldType field_type) {
+    switch (field_type) {
+        case FieldType::STRING:
+            return BTreeKeyType::STRING;
+        case FieldType::INT:
+            return BTreeKeyType::INT;
+        case FieldType::FLOAT:
+            return BTreeKeyType::FLOAT;
+        case FieldType::BOOL:
+            return BTreeKeyType::BOOL;
+        case FieldType::STRING_ARRAY:
+        case FieldType::INT_ARRAY:
+            // Arrays are indexed as individual elements (multi-valued index)
+            // For now, treat as their element type
+            throw std::runtime_error("Array fields are not supported for B-tree indexing");
+        default:
+            throw std::runtime_error("Unknown field type for B-tree indexing");
+    }
+}
+
+/**
+ * Convert a MetadataValue to a BTreeKey for indexing.
+ */
+std::optional<BTreeKey> metadata_value_to_btree_key(const MetadataValue& value) {
+    return std::visit([](auto&& v) -> std::optional<BTreeKey> {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return std::nullopt;  // Null values not indexed
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            return BTreeKey(v);
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            return BTreeKey(v);
+        } else if constexpr (std::is_same_v<T, double>) {
+            return BTreeKey(v);
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return BTreeKey(v);
+        } else {
+            // Arrays not supported for simple B-tree key
+            return std::nullopt;
+        }
+    }, value);
+}
+
+/**
+ * Convert a JSON value to MetadataValue.
+ */
+MetadataValue json_to_metadata_value(const nlohmann::json& j) {
+    if (j.is_null()) {
+        return std::monostate{};
+    } else if (j.is_string()) {
+        return j.get<std::string>();
+    } else if (j.is_number_integer()) {
+        return j.get<int64_t>();
+    } else if (j.is_number_float()) {
+        return j.get<double>();
+    } else if (j.is_boolean()) {
+        return j.get<bool>();
+    } else if (j.is_array() && !j.empty()) {
+        if (j[0].is_string()) {
+            return j.get<std::vector<std::string>>();
+        } else if (j[0].is_number_integer()) {
+            return j.get<std::vector<int64_t>>();
+        }
+    }
+    return std::monostate{};
 }
 
 //=============================================================================
@@ -564,7 +640,7 @@ std::unique_ptr<Collection> Collection::open(const std::string& name) {
                 // Create HNSW object with correct params for recovery using collection's distance metric
                 auto hnsw = createHNSWIndex(
                     collection->distance_metric_,  // Use collection's distance metric
-                    1000000,                  // max_elements
+                    10000000,                 // max_elements (10M)
                     collection->vector_dim_,  // dim
                     hnsw_config.M,            // M from catalog
                     hnsw_config.ef_construction, // ef_construction from catalog
@@ -780,6 +856,9 @@ std::vector<uint64_t> Collection::add(const std::vector<std::string>& contents,
             doc.content = contents[i];
             doc.metadata = metadatas[i];
             write_document(doc);
+            
+            // Update btree indices for this document
+            update_btree_indices_for_document(doc.id, doc.metadata, false);
         }
         doc_count_.fetch_add(contents.size());
     }
@@ -892,6 +971,7 @@ void Collection::update(const std::vector<uint64_t>& ids,
     for (size_t i = 0; i < ids.size(); ++i) {
         // Read existing document
         Document doc = read_document(ids[i]);
+        nlohmann::json old_metadata = doc.metadata;
         
         // Merge metadata (partial update)
         for (auto& [key, val] : metadatas[i].items()) {
@@ -905,9 +985,15 @@ void Collection::update(const std::vector<uint64_t>& ids,
                                      std::to_string(ids[i]) + ": " + error);
         }
         
+        // Remove old metadata from btree indices
+        update_btree_indices_for_document(ids[i], old_metadata, true);
+        
         // Delete old and write new
         delete_document_internal(ids[i]);
         write_document(doc);
+        
+        // Add new metadata to btree indices
+        update_btree_indices_for_document(ids[i], doc.metadata, false);
     }
 }
 
@@ -915,6 +1001,14 @@ void Collection::delete_docs(const std::vector<uint64_t>& ids) {
     std::unique_lock lock(mutex_);
     
     for (uint64_t id : ids) {
+        // Read document to get metadata for btree index removal
+        try {
+            Document doc = read_document(id);
+            update_btree_indices_for_document(id, doc.metadata, true);
+        } catch (...) {
+            // Document may not exist - continue with deletion
+        }
+        
         delete_document_internal(id);
         doc_count_.fetch_sub(1);
     }
@@ -928,6 +1022,14 @@ size_t Collection::delete_docs(const FilterCondition& where) {
     std::vector<uint64_t> matching_ids = evaluate_filter(where);
     
     for (uint64_t id : matching_ids) {
+        // Read document to get metadata for btree index removal
+        try {
+            Document doc = read_document(id);
+            update_btree_indices_for_document(id, doc.metadata, true);
+        } catch (...) {
+            // Document may not exist - continue with deletion
+        }
+        
         delete_document_internal(id);
     }
     
@@ -972,7 +1074,7 @@ void Collection::create_hnsw_index(const std::string& name, size_t M, size_t ef_
         handle = catalog.create_hnsw_index(
             full_name,  // Prefix with collection name
             vector_dim_,
-            1000000,  // max_elements - will grow as needed
+            10000000,  // max_elements (10M) - will grow as needed
             M,
             ef_construction
         );
@@ -981,7 +1083,7 @@ void Collection::create_hnsw_index(const std::string& name, size_t M, size_t ef_
     // Create actual HNSW object using collection's distance metric (will recover if data exists)
     auto hnsw = createHNSWIndex(
         distance_metric_,  // Use collection's distance metric
-        1000000,        // max_elements
+        10000000,       // max_elements (10M)
         vector_dim_,    // dim
         M,              // M
         ef_construction, // ef_construction
@@ -1312,6 +1414,85 @@ void Collection::create_metadata_index(const std::string& name, const MetadataIn
     
     indices_[name] = info;
     
+    // Create in-memory BTreeMetadataIndex for single-field indices
+    // (Multi-field composite indices require different handling)
+    if (config.fields.size() == 1) {
+        const std::string& field_name = config.fields[0];
+        const FieldDef* field_def = schema_.get_field(field_name);
+        if (field_def) {
+            try {
+                BTreeKeyType key_type = field_type_to_btree_key_type(field_def->type);
+                auto btree_idx = std::make_unique<BTreeMetadataIndex>(
+                    field_name, key_type, config.unique);
+                
+                // Always populate index with existing documents
+                // (The in-memory BTreeMetadataIndex needs to be rebuilt from documents)
+                if (doc_count_.load() > 0) {
+                    // Scan existing documents and index them
+                    constexpr size_t page_header_size = sizeof(DocumentPageHeader);
+                    PID current_page = doc_pages_head_;
+                    
+                    while (current_page != 0) {
+                        try {
+                            GuardO<Page> page(current_page);
+                            auto* page_header = reinterpret_cast<const DocumentPageHeader*>(page.ptr);
+                            auto* slots = reinterpret_cast<const SlotEntry*>(
+                                reinterpret_cast<const uint8_t*>(page.ptr) + page_header_size);
+                            
+                            PID next_page = page_header->next_page;
+                            uint16_t slot_count = page_header->slot_count;
+                            
+                            for (uint16_t slot_num = 0; slot_num < slot_count; ++slot_num) {
+                                const SlotEntry& slot = slots[slot_num];
+                                if (slot.is_deleted()) continue;
+                                
+                                auto* rec_header = reinterpret_cast<const DocumentRecordHeader*>(
+                                    reinterpret_cast<const uint8_t*>(page.ptr) + slot.offset);
+                                uint64_t doc_id = rec_header->doc_id;
+                                
+                                // Release page guard before reading doc
+                                page.release();
+                                
+                                try {
+                                    Document doc = read_document(doc_id);
+                                    if (doc.metadata.contains(field_name)) {
+                                        MetadataValue mv = json_to_metadata_value(doc.metadata[field_name]);
+                                        auto btree_key = metadata_value_to_btree_key(mv);
+                                        if (btree_key) {
+                                            btree_idx->insert(*btree_key, doc_id);
+                                        }
+                                    }
+                                } catch (...) {
+                                    // Skip documents that can't be read
+                                }
+                                
+                                // Re-acquire page if needed
+                                if (slot_num + 1 < slot_count) {
+                                    page = GuardO<Page>(current_page);
+                                    page_header = reinterpret_cast<const DocumentPageHeader*>(page.ptr);
+                                    slots = reinterpret_cast<const SlotEntry*>(
+                                        reinterpret_cast<const uint8_t*>(page.ptr) + page_header_size);
+                                }
+                            }
+                            
+                            current_page = next_page;
+                        } catch (...) {
+                            break;
+                        }
+                    }
+                }
+                
+                btree_indices_[name] = std::move(btree_idx);
+                CALIBY_LOG_INFO("Collection", "Created in-memory btree index '", name, 
+                               "' for field '", field_name, "', total btree_indices_.size()=", 
+                               btree_indices_.size());
+            } catch (const std::exception& e) {
+                CALIBY_LOG_WARN("Collection", "Could not create in-memory btree index for '", 
+                              name, "': ", e.what());
+            }
+        }
+    }
+    
     // Log index creation
     if (recovering) {
         if (config.fields.size() == 1) {
@@ -1439,23 +1620,20 @@ std::vector<SearchResult> Collection::search_vector(
         HNSWIndexBase* hnsw = hnsw_it->second.get();
         
         if (where.has_value()) {
-            // Post-search filtering with over-fetching and retry
-            // For 10% selectivity, need ~10x over-fetch minimum. Start higher for safety.
-            // Also increase ef_search to explore more of the graph for better recall.
+            // Strategy: Try post-filtering first with increasing over-fetch multipliers.
+            // If that fails to find enough results, fall back to pre-filtering via B-tree.
+            
             const size_t max_elements = doc_count_.load();
-            const std::vector<size_t> multipliers = {2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
+            const std::vector<size_t> multipliers = {2, 4, 8, 16, 32};
             
             // Boost ef_search for filtered queries to explore more neighbors
             size_t filtered_ef_search = std::max(ef_search, static_cast<size_t>(200));
             
-            for (size_t mult_idx = 0; mult_idx <= multipliers.size(); ++mult_idx) {
-                size_t search_k;
-                if (mult_idx < multipliers.size()) {
-                    search_k = std::min(k * multipliers[mult_idx], max_elements);
-                } else {
-                    // Last resort: search all elements
-                    search_k = max_elements;
-                }
+            bool post_filter_succeeded = false;
+            
+            // Phase 1: Post-filtering with progressive over-fetching
+            for (size_t mult_idx = 0; mult_idx < multipliers.size(); ++mult_idx) {
+                size_t search_k = std::min(k * multipliers[mult_idx], max_elements);
                 
                 auto knn_results = hnsw->searchKnn(vector.data(), search_k, filtered_ef_search);
                 results.clear();
@@ -1484,9 +1662,42 @@ std::vector<SearchResult> Collection::search_vector(
                     }
                 }
                 
-                // If we found enough results, we're done
-                if (results.size() >= k || search_k >= max_elements) {
+                // If we found enough results, we're done with post-filtering
+                if (results.size() >= k) {
+                    post_filter_succeeded = true;
                     break;
+                }
+            }
+            
+            // Phase 2: Pre-filtering fallback if post-filtering didn't find enough results
+            if (!post_filter_succeeded && results.size() < k) {
+                // Use evaluate_filter to get all matching document IDs
+                // This does a scan through document pages and evaluates the filter
+                std::vector<uint64_t> matching_ids = evaluate_filter(*where);
+                
+                if (!matching_ids.empty()) {
+                    // Compute distances to all matching candidates and get top-k
+                    auto prefilter_results = hnsw->computeDistances(vector.data(), matching_ids, k);
+                    
+                    results.clear();
+                    for (const auto& [dist, node_id] : prefilter_results) {
+                        uint64_t doc_id = static_cast<uint64_t>(node_id);
+                        
+                        SearchResult result;
+                        result.doc_id = doc_id;
+                        result.score = dist;
+                        result.vector_score = dist;
+                        try {
+                            result.document = read_document(doc_id);
+                        } catch (...) {
+                            // Document load failed, still return result
+                        }
+                        results.push_back(std::move(result));
+                        
+                        if (results.size() >= k) {
+                            break;
+                        }
+                    }
                 }
             }
         } else {
@@ -2306,11 +2517,153 @@ void Collection::rebuild_id_index() {
 // Filter Evaluation
 //=============================================================================
 
+// Helper to convert filter value to BTreeKey
+static std::optional<BTreeKey> filter_value_to_btree_key(const FilterCondition& filter) {
+    return std::visit([](auto&& v) -> std::optional<BTreeKey> {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return std::nullopt;
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            return BTreeKey(v);
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            return BTreeKey(v);
+        } else if constexpr (std::is_same_v<T, double>) {
+            return BTreeKey(v);
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return BTreeKey(v);
+        } else {
+            return std::nullopt;  // Arrays not supported
+        }
+    }, filter.value);
+}
+
 std::vector<uint64_t> Collection::evaluate_filter(const FilterCondition& filter) {
-    std::vector<uint64_t> matching_ids;
+    // Debug: Log btree index lookup attempt
+    CALIBY_LOG_DEBUG("Collection", "evaluate_filter: field='", filter.field, 
+                    "', op=", static_cast<int>(filter.op), 
+                    ", btree_indices_.size()=", btree_indices_.size());
     
-    // Simple scan-based evaluation
-    // TODO: Use B-tree indices for indexed fields
+    // Try to use B-tree index for simple conditions on indexed fields
+    if (!filter.field.empty()) {
+        BTreeMetadataIndex* btree_idx = find_btree_index_for_field(filter.field);
+        
+        CALIBY_LOG_DEBUG("Collection", "evaluate_filter: find_btree_index_for_field('", 
+                        filter.field, "') returned ", (btree_idx ? "non-null" : "null"));
+        
+        if (btree_idx) {
+            auto btree_key = filter_value_to_btree_key(filter);
+            
+            if (btree_key) {
+                switch (filter.op) {
+                    case FilterOp::EQ: {
+                        // Exact lookup using B-tree
+                        return btree_idx->lookup(*btree_key);
+                    }
+                    case FilterOp::GT: {
+                        // Greater than (exclusive)
+                        return btree_idx->greater_than(*btree_key, false);
+                    }
+                    case FilterOp::GTE: {
+                        // Greater than or equal (inclusive)
+                        return btree_idx->greater_than(*btree_key, true);
+                    }
+                    case FilterOp::LT: {
+                        // Less than (exclusive)
+                        return btree_idx->less_than(*btree_key, false);
+                    }
+                    case FilterOp::LTE: {
+                        // Less than or equal (inclusive)
+                        return btree_idx->less_than(*btree_key, true);
+                    }
+                    default:
+                        // NE, IN, NIN, CONTAINS - fall through to scan
+                        break;
+                }
+            }
+        }
+    }
+    
+    // Handle AND/OR with btree optimization where possible
+    if (filter.op == FilterOp::AND && !filter.children.empty()) {
+        // For AND, we can use btree for any indexed child, then filter the rest
+        // Find the most selective btree-indexed condition
+        std::vector<uint64_t> result;
+        bool have_btree_result = false;
+        std::vector<const FilterCondition*> remaining_conditions;
+        
+        for (const auto& child : filter.children) {
+            if (!child.field.empty()) {
+                BTreeMetadataIndex* btree_idx = find_btree_index_for_field(child.field);
+                auto btree_key = filter_value_to_btree_key(child);
+                
+                if (btree_idx && btree_key && 
+                    (child.op == FilterOp::EQ || child.op == FilterOp::GT || 
+                     child.op == FilterOp::GTE || child.op == FilterOp::LT || 
+                     child.op == FilterOp::LTE)) {
+                    
+                    if (!have_btree_result) {
+                        // Use first btree-indexed condition as base
+                        result = evaluate_filter(child);
+                        have_btree_result = true;
+                    } else {
+                        // Intersect with additional btree results
+                        auto other = evaluate_filter(child);
+                        std::sort(result.begin(), result.end());
+                        std::sort(other.begin(), other.end());
+                        std::vector<uint64_t> intersection;
+                        std::set_intersection(result.begin(), result.end(),
+                                            other.begin(), other.end(),
+                                            std::back_inserter(intersection));
+                        result = std::move(intersection);
+                    }
+                    continue;
+                }
+            }
+            remaining_conditions.push_back(&child);
+        }
+        
+        if (have_btree_result) {
+            // Filter remaining conditions by scanning matched docs
+            if (!remaining_conditions.empty()) {
+                std::vector<uint64_t> final_result;
+                for (uint64_t doc_id : result) {
+                    try {
+                        Document doc = read_document(doc_id);
+                        bool passes = true;
+                        for (const auto* cond : remaining_conditions) {
+                            if (!cond->evaluate(doc.metadata)) {
+                                passes = false;
+                                break;
+                            }
+                        }
+                        if (passes) {
+                            final_result.push_back(doc_id);
+                        }
+                    } catch (...) {
+                        // Skip documents that can't be read
+                    }
+                }
+                return final_result;
+            }
+            return result;
+        }
+    }
+    
+    if (filter.op == FilterOp::OR && !filter.children.empty()) {
+        // For OR, collect results from all children and union
+        std::vector<uint64_t> result;
+        for (const auto& child : filter.children) {
+            auto child_result = evaluate_filter(child);
+            result.insert(result.end(), child_result.begin(), child_result.end());
+        }
+        // Remove duplicates
+        std::sort(result.begin(), result.end());
+        result.erase(std::unique(result.begin(), result.end()), result.end());
+        return result;
+    }
+    
+    // Fall back to scan-based evaluation
+    std::vector<uint64_t> matching_ids;
     
     // Scan document pages to get all doc IDs
     // (DocIdIndex doesn't support iteration, so we scan the page chain)
@@ -2405,6 +2758,42 @@ float Collection::estimate_selectivity(const FilterCondition& filter) {
         }
         default:
             return 0.5f;
+    }
+}
+
+BTreeMetadataIndex* Collection::find_btree_index_for_field(const std::string& field_name) const {
+    // Search through all btree indices to find one that indexes the given field
+    for (const auto& [index_name, btree_idx] : btree_indices_) {
+        if (btree_idx && btree_idx->field_name() == field_name) {
+            return btree_idx.get();
+        }
+    }
+    return nullptr;
+}
+
+void Collection::update_btree_indices_for_document(uint64_t doc_id, const nlohmann::json& metadata, bool is_delete) {
+    // Update all btree indices with this document's metadata
+    for (const auto& [index_name, btree_idx] : btree_indices_) {
+        if (!btree_idx) continue;
+        
+        const std::string& field_name = btree_idx->field_name();
+        if (!metadata.contains(field_name)) continue;
+        
+        try {
+            MetadataValue mv = json_to_metadata_value(metadata.at(field_name));
+            auto btree_key = metadata_value_to_btree_key(mv);
+            if (!btree_key) continue;
+            
+            if (is_delete) {
+                btree_idx->remove(*btree_key, doc_id);
+            } else {
+                btree_idx->insert(*btree_key, doc_id);
+            }
+        } catch (const std::exception& e) {
+            // Log but don't fail - btree index is an optimization
+            CALIBY_LOG_WARN("Collection", "Failed to update btree index '", index_name, 
+                          "' for doc ", doc_id, ": ", e.what());
+        }
     }
 }
 

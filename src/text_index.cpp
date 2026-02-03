@@ -158,14 +158,24 @@ std::vector<uint8_t> PostingList::serializeFrom(size_t startOffset, size_t maxBy
     size_t availablePostings = postings_.size() > startOffset ? postings_.size() - startOffset : 0;
     size_t toSerialize = std::min(maxPostings, availablePostings);
     
-    // Calculate actual size needed
-    size_t dataSize = sizeof(PostingListHeader) + toSerialize * sizeof(CompactPosting);
-    data.resize(dataSize);
+    // Calculate capacity with growth factor for future appends
+    size_t capacity = static_cast<size_t>(toSerialize * POSTING_GROWTH_FACTOR);
+    if (capacity < INITIAL_POSTING_CAPACITY) {
+        capacity = INITIAL_POSTING_CAPACITY;
+    }
+    if (capacity > maxPostings) {
+        capacity = maxPostings;
+    }
+    
+    // Calculate actual size needed (allocate for full capacity)
+    size_t dataSize = payloadSizeForCapacity(capacity);
+    data.resize(dataSize, 0);  // Zero-initialize for unused capacity
     
     // Fill header
     PostingListHeader* header = reinterpret_cast<PostingListHeader*>(data.data());
     header->doc_freq = static_cast<uint32_t>(postings_.size());
     header->num_postings = static_cast<uint32_t>(toSerialize);
+    header->capacity = static_cast<uint32_t>(capacity);
     header->overflow_slot_id = 0;  // Caller sets this if needed
     header->is_overflow = (startOffset > 0) ? 1 : 0;
     std::memset(header->reserved, 0, sizeof(header->reserved));
@@ -340,7 +350,12 @@ void TextIndex::index_document(uint64_t doc_id, const std::string& content,
 }
 
 void TextIndex::insert_or_update_posting(const std::string& term, uint64_t doc_id, uint16_t term_freq) {
-    // Load existing posting list (if any)
+    // Try append-only fast path first
+    if (append_posting(term, doc_id, term_freq)) {
+        return;  // Success - posting was appended in-place
+    }
+    
+    // Slow path: need to rebuild posting list (rare - only on overflow)
     PostingList list = load_posting_list(term);
     
     // Check if this is a new term
@@ -496,6 +511,375 @@ void TextIndex::save_posting_list(const std::string& term, const PostingList& li
     }
 }
 
+std::vector<uint8_t> TextIndex::create_chunk_with_capacity(size_t capacity, uint32_t doc_freq) {
+    size_t dataSize = payloadSizeForCapacity(capacity);
+    std::vector<uint8_t> data(dataSize, 0);
+    
+    PostingListHeader* header = reinterpret_cast<PostingListHeader*>(data.data());
+    header->doc_freq = doc_freq;
+    header->num_postings = 0;
+    header->capacity = static_cast<uint32_t>(capacity);
+    header->overflow_slot_id = 0;
+    header->is_overflow = 0;
+    std::memset(header->reserved, 0, sizeof(header->reserved));
+    
+    return data;
+}
+
+bool TextIndex::append_posting(const std::string& term, uint64_t doc_id, uint16_t term_freq) {
+    if (!term_btree_) {
+        return false;
+    }
+    
+    // Create key from term
+    std::span<uint8_t> key(reinterpret_cast<uint8_t*>(const_cast<char*>(term.data())), term.size());
+    
+    // Try to find existing entry and check if there's space
+    bool found = false;
+    bool has_space = false;
+    uint32_t current_num_postings = 0;
+    uint32_t current_capacity = 0;
+    uint32_t current_doc_freq = 0;
+    uint32_t overflow_idx = 0;
+    std::string last_key = term;
+    
+    // First, check the main entry
+    found = term_btree_->lookup(key, [&](std::span<uint8_t> payload) {
+        if (payload.size() >= sizeof(PostingListHeader)) {
+            const PostingListHeader* header = reinterpret_cast<const PostingListHeader*>(payload.data());
+            current_num_postings = header->num_postings;
+            current_capacity = header->capacity;
+            current_doc_freq = header->doc_freq;
+            overflow_idx = header->overflow_slot_id;
+            has_space = (current_num_postings < current_capacity);
+        }
+    });
+    
+    // If no entry exists, create new one with initial capacity
+    if (!found) {
+        auto chunk = create_chunk_with_capacity(INITIAL_POSTING_CAPACITY, 1);
+        PostingListHeader* header = reinterpret_cast<PostingListHeader*>(chunk.data());
+        header->doc_freq = 1;
+        header->num_postings = 1;
+        
+        // Add the posting
+        CompactPosting* postings = reinterpret_cast<CompactPosting*>(chunk.data() + sizeof(PostingListHeader));
+        postings[0].doc_id = doc_id;
+        postings[0].term_freq = term_freq;
+        
+        std::span<uint8_t> payloadSpan(chunk.data(), chunk.size());
+        term_btree_->insert(key, payloadSpan);
+        
+        vocab_size_.fetch_add(1);
+        return true;
+    }
+    
+    // Follow overflow chain to find last chunk
+    while (overflow_idx != 0) {
+        std::string overflow_key = term;
+        overflow_key.push_back('\0');
+        overflow_key.append(reinterpret_cast<const char*>(&overflow_idx), sizeof(overflow_idx));
+        
+        std::span<uint8_t> okey(reinterpret_cast<uint8_t*>(const_cast<char*>(overflow_key.data())), overflow_key.size());
+        
+        uint32_t next_overflow = 0;
+        bool overflow_found = term_btree_->lookup(okey, [&](std::span<uint8_t> payload) {
+            if (payload.size() >= sizeof(PostingListHeader)) {
+                const PostingListHeader* header = reinterpret_cast<const PostingListHeader*>(payload.data());
+                current_num_postings = header->num_postings;
+                current_capacity = header->capacity;
+                next_overflow = header->overflow_slot_id;
+                has_space = (current_num_postings < current_capacity);
+                last_key = overflow_key;
+            }
+        });
+        
+        if (!overflow_found) {
+            break;
+        }
+        
+        overflow_idx = next_overflow;
+        if (overflow_idx != 0) {
+            // Continue to next chunk
+        }
+    }
+    
+    // If last chunk has space, append in-place
+    if (has_space) {
+        std::span<uint8_t> lastKey(reinterpret_cast<uint8_t*>(const_cast<char*>(last_key.data())), last_key.size());
+        
+        bool updated = term_btree_->updateInPlace(lastKey, [&](std::span<uint8_t> payload) {
+            if (payload.size() >= sizeof(PostingListHeader)) {
+                PostingListHeader* header = reinterpret_cast<PostingListHeader*>(payload.data());
+                
+                if (header->num_postings < header->capacity) {
+                    // Append posting
+                    CompactPosting* postings = reinterpret_cast<CompactPosting*>(payload.data() + sizeof(PostingListHeader));
+                    postings[header->num_postings].doc_id = doc_id;
+                    postings[header->num_postings].term_freq = term_freq;
+                    header->num_postings++;
+                }
+            }
+        });
+        
+        if (updated) {
+            // Also update doc_freq in main entry if we're in an overflow chunk
+            if (last_key != term) {
+                term_btree_->updateInPlace(key, [&](std::span<uint8_t> payload) {
+                    if (payload.size() >= sizeof(PostingListHeader)) {
+                        PostingListHeader* header = reinterpret_cast<PostingListHeader*>(payload.data());
+                        header->doc_freq++;
+                    }
+                });
+            } else {
+                // Main chunk - doc_freq already updated in place
+                term_btree_->updateInPlace(key, [&](std::span<uint8_t> payload) {
+                    if (payload.size() >= sizeof(PostingListHeader)) {
+                        PostingListHeader* header = reinterpret_cast<PostingListHeader*>(payload.data());
+                        header->doc_freq++;
+                    }
+                });
+            }
+            return true;
+        }
+    }
+    
+    // Last chunk is full - need to create a new overflow chunk
+    // Calculate new capacity with 1.3x growth factor
+    size_t newCapacity = static_cast<size_t>(current_capacity * POSTING_GROWTH_FACTOR);
+    if (newCapacity < INITIAL_POSTING_CAPACITY) {
+        newCapacity = INITIAL_POSTING_CAPACITY;
+    }
+    
+    // Make sure new capacity fits in max payload size
+    size_t maxCapacity = maxPostingsInPayload(MAX_INLINE_POSTING_BYTES);
+    if (newCapacity > maxCapacity) {
+        newCapacity = maxCapacity;
+    }
+    
+    // Determine the new overflow index
+    uint32_t newOverflowIdx = 1;
+    if (last_key != term) {
+        // Extract overflow index from last_key
+        // Format: term + null + overflow_idx
+        size_t termLen = term.size();
+        if (last_key.size() > termLen + 1 + sizeof(uint32_t)) {
+            std::memcpy(&newOverflowIdx, last_key.data() + termLen + 1, sizeof(uint32_t));
+        }
+        newOverflowIdx++;
+    }
+    
+    // Create new overflow chunk
+    auto newChunk = create_chunk_with_capacity(newCapacity, current_doc_freq + 1);
+    PostingListHeader* newHeader = reinterpret_cast<PostingListHeader*>(newChunk.data());
+    newHeader->doc_freq = current_doc_freq + 1;
+    newHeader->num_postings = 1;
+    newHeader->is_overflow = 1;
+    
+    // Add the posting to new chunk
+    CompactPosting* newPostings = reinterpret_cast<CompactPosting*>(newChunk.data() + sizeof(PostingListHeader));
+    newPostings[0].doc_id = doc_id;
+    newPostings[0].term_freq = term_freq;
+    
+    // Create key for new overflow chunk
+    std::string newOverflowKey = term;
+    newOverflowKey.push_back('\0');
+    newOverflowKey.append(reinterpret_cast<const char*>(&newOverflowIdx), sizeof(newOverflowIdx));
+    
+    std::span<uint8_t> newOverflowKeySpan(reinterpret_cast<uint8_t*>(const_cast<char*>(newOverflowKey.data())), newOverflowKey.size());
+    std::span<uint8_t> newChunkSpan(newChunk.data(), newChunk.size());
+    
+    // Insert new overflow chunk
+    term_btree_->insert(newOverflowKeySpan, newChunkSpan);
+    
+    // Update the previous chunk's overflow pointer
+    std::span<uint8_t> lastKeySpan(reinterpret_cast<uint8_t*>(const_cast<char*>(last_key.data())), last_key.size());
+    term_btree_->updateInPlace(lastKeySpan, [&](std::span<uint8_t> payload) {
+        if (payload.size() >= sizeof(PostingListHeader)) {
+            PostingListHeader* header = reinterpret_cast<PostingListHeader*>(payload.data());
+            header->overflow_slot_id = newOverflowIdx;
+        }
+    });
+    
+    // Update doc_freq in main entry
+    term_btree_->updateInPlace(key, [&](std::span<uint8_t> payload) {
+        if (payload.size() >= sizeof(PostingListHeader)) {
+            PostingListHeader* header = reinterpret_cast<PostingListHeader*>(payload.data());
+            header->doc_freq++;
+        }
+    });
+    
+    return true;
+}
+
+bool TextIndex::append_postings_batch(const std::string& term,
+                                       const std::vector<std::pair<uint64_t, uint16_t>>& postings) {
+    if (!term_btree_ || postings.empty()) {
+        return false;
+    }
+    
+    // Create key from term
+    std::span<uint8_t> key(reinterpret_cast<uint8_t*>(const_cast<char*>(term.data())), term.size());
+    
+    // Check if term exists and get current state
+    bool found = false;
+    uint32_t current_num_postings = 0;
+    uint32_t current_capacity = 0;
+    uint32_t current_doc_freq = 0;
+    uint32_t overflow_idx = 0;
+    std::string last_key = term;
+    
+    found = term_btree_->lookup(key, [&](std::span<uint8_t> payload) {
+        if (payload.size() >= sizeof(PostingListHeader)) {
+            const PostingListHeader* header = reinterpret_cast<const PostingListHeader*>(payload.data());
+            current_num_postings = header->num_postings;
+            current_capacity = header->capacity;
+            current_doc_freq = header->doc_freq;
+            overflow_idx = header->overflow_slot_id;
+        }
+    });
+    
+    // If term doesn't exist, return false so caller creates new entry
+    if (!found) {
+        return false;
+    }
+    
+    // Follow overflow chain to find last chunk
+    while (overflow_idx != 0) {
+        std::string overflow_key = term;
+        overflow_key.push_back('\0');
+        overflow_key.append(reinterpret_cast<const char*>(&overflow_idx), sizeof(overflow_idx));
+        
+        std::span<uint8_t> okey(reinterpret_cast<uint8_t*>(const_cast<char*>(overflow_key.data())), overflow_key.size());
+        
+        uint32_t next_overflow = 0;
+        bool overflow_found = term_btree_->lookup(okey, [&](std::span<uint8_t> payload) {
+            if (payload.size() >= sizeof(PostingListHeader)) {
+                const PostingListHeader* header = reinterpret_cast<const PostingListHeader*>(payload.data());
+                current_num_postings = header->num_postings;
+                current_capacity = header->capacity;
+                next_overflow = header->overflow_slot_id;
+                last_key = overflow_key;
+            }
+        });
+        
+        if (!overflow_found) {
+            break;
+        }
+        
+        if (next_overflow != 0) {
+            overflow_idx = next_overflow;
+        } else {
+            break;
+        }
+    }
+    
+    // Now append postings one by one, efficiently filling chunks
+    size_t postings_added = 0;
+    
+    while (postings_added < postings.size()) {
+        uint32_t space_available = current_capacity - current_num_postings;
+        
+        if (space_available > 0) {
+            // Fill current chunk
+            size_t to_add = std::min(static_cast<size_t>(space_available), 
+                                     postings.size() - postings_added);
+            
+            std::span<uint8_t> lastKeySpan(reinterpret_cast<uint8_t*>(const_cast<char*>(last_key.data())), last_key.size());
+            
+            // Capture the postings to add
+            size_t start_idx = postings_added;
+            size_t end_idx = postings_added + to_add;
+            
+            term_btree_->updateInPlace(lastKeySpan, [&](std::span<uint8_t> payload) {
+                if (payload.size() >= sizeof(PostingListHeader)) {
+                    PostingListHeader* header = reinterpret_cast<PostingListHeader*>(payload.data());
+                    CompactPosting* dest = reinterpret_cast<CompactPosting*>(payload.data() + sizeof(PostingListHeader));
+                    
+                    for (size_t i = start_idx; i < end_idx && header->num_postings < header->capacity; ++i) {
+                        dest[header->num_postings].doc_id = postings[i].first;
+                        dest[header->num_postings].term_freq = postings[i].second;
+                        header->num_postings++;
+                    }
+                }
+            });
+            
+            postings_added += to_add;
+            current_num_postings += to_add;
+        }
+        
+        // If we still have postings to add, create a new overflow chunk
+        if (postings_added < postings.size()) {
+            // Calculate capacity for new chunk
+            size_t remaining = postings.size() - postings_added;
+            size_t newCapacity = std::max(INITIAL_POSTING_CAPACITY,
+                                          static_cast<size_t>(remaining * POSTING_GROWTH_FACTOR));
+            size_t maxCapacity = maxPostingsInPayload(MAX_INLINE_POSTING_BYTES);
+            if (newCapacity > maxCapacity) {
+                newCapacity = maxCapacity;
+            }
+            
+            // Determine new overflow index
+            uint32_t newOverflowIdx = 1;
+            if (last_key != term) {
+                size_t termLen = term.size();
+                if (last_key.size() >= termLen + 1 + sizeof(uint32_t)) {
+                    std::memcpy(&newOverflowIdx, last_key.data() + termLen + 1, sizeof(uint32_t));
+                }
+                newOverflowIdx++;
+            }
+            
+            // Create new chunk and fill it
+            size_t to_add = std::min(newCapacity, remaining);
+            auto newChunk = create_chunk_with_capacity(newCapacity, current_doc_freq + static_cast<uint32_t>(postings.size()));
+            PostingListHeader* newHeader = reinterpret_cast<PostingListHeader*>(newChunk.data());
+            newHeader->num_postings = static_cast<uint32_t>(to_add);
+            newHeader->is_overflow = 1;
+            
+            CompactPosting* dest = reinterpret_cast<CompactPosting*>(newChunk.data() + sizeof(PostingListHeader));
+            for (size_t i = 0; i < to_add; ++i) {
+                dest[i].doc_id = postings[postings_added + i].first;
+                dest[i].term_freq = postings[postings_added + i].second;
+            }
+            
+            // Create key for new overflow chunk
+            std::string newOverflowKey = term;
+            newOverflowKey.push_back('\0');
+            newOverflowKey.append(reinterpret_cast<const char*>(&newOverflowIdx), sizeof(newOverflowIdx));
+            
+            std::span<uint8_t> newKeySpan(reinterpret_cast<uint8_t*>(const_cast<char*>(newOverflowKey.data())), newOverflowKey.size());
+            std::span<uint8_t> newChunkSpan(newChunk.data(), newChunk.size());
+            
+            // Insert new chunk
+            term_btree_->insert(newKeySpan, newChunkSpan);
+            
+            // Update previous chunk's overflow pointer
+            std::span<uint8_t> lastKeySpan(reinterpret_cast<uint8_t*>(const_cast<char*>(last_key.data())), last_key.size());
+            term_btree_->updateInPlace(lastKeySpan, [&](std::span<uint8_t> payload) {
+                if (payload.size() >= sizeof(PostingListHeader)) {
+                    PostingListHeader* header = reinterpret_cast<PostingListHeader*>(payload.data());
+                    header->overflow_slot_id = newOverflowIdx;
+                }
+            });
+            
+            postings_added += to_add;
+            last_key = newOverflowKey;
+            current_num_postings = static_cast<uint32_t>(to_add);
+            current_capacity = static_cast<uint32_t>(newCapacity);
+        }
+    }
+    
+    // Update doc_freq in main entry
+    term_btree_->updateInPlace(key, [&](std::span<uint8_t> payload) {
+        if (payload.size() >= sizeof(PostingListHeader)) {
+            PostingListHeader* header = reinterpret_cast<PostingListHeader*>(payload.data());
+            header->doc_freq += static_cast<uint32_t>(postings.size());
+        }
+    });
+    
+    return true;
+}
+
 void TextIndex::remove_document(uint64_t doc_id) {
     std::unique_lock lock(mutex_);
     
@@ -560,31 +944,68 @@ void TextIndex::index_batch(const std::vector<uint64_t>& doc_ids,
         }
     }
     
-    // Phase 2: Write all posting lists to BTree
+    // Phase 2: Write all posting lists using append-only optimization
     uint64_t new_terms = 0;
-    bool index_is_empty = (vocab_size_.load() == 0);
     
     for (const auto& [term, postings] : term_postings) {
-        PostingList list;
-        
-        // Only load existing posting list if index is not empty
-        if (!index_is_empty) {
-            list = load_posting_list(term);
-        }
-        
-        // Check if this is a new term
-        bool is_new_term = (list.doc_freq() == 0);
-        if (is_new_term) {
+        // Try batch append first (returns false if term doesn't exist)
+        if (!append_postings_batch(term, postings)) {
+            // New term - create initial chunk with all postings (handle overflow inline)
+            size_t maxCapacity = maxPostingsInPayload(MAX_INLINE_POSTING_BYTES);
+            size_t firstChunkCapacity = std::max(INITIAL_POSTING_CAPACITY, 
+                                                  static_cast<size_t>(postings.size() * POSTING_GROWTH_FACTOR));
+            if (firstChunkCapacity > maxCapacity) {
+                firstChunkCapacity = maxCapacity;
+            }
+            
+            size_t postings_added = 0;
+            uint32_t overflow_idx = 0;
+            std::string current_key = term;
+            
+            while (postings_added < postings.size()) {
+                size_t remaining = postings.size() - postings_added;
+                size_t capacity = (overflow_idx == 0) ? firstChunkCapacity : 
+                                   std::max(INITIAL_POSTING_CAPACITY,
+                                            static_cast<size_t>(remaining * POSTING_GROWTH_FACTOR));
+                if (capacity > maxCapacity) {
+                    capacity = maxCapacity;
+                }
+                
+                size_t to_add = std::min(capacity, remaining);
+                bool has_more = (postings_added + to_add) < postings.size();
+                
+                auto chunk = create_chunk_with_capacity(capacity, static_cast<uint32_t>(postings.size()));
+                PostingListHeader* header = reinterpret_cast<PostingListHeader*>(chunk.data());
+                header->doc_freq = static_cast<uint32_t>(postings.size());
+                header->num_postings = static_cast<uint32_t>(to_add);
+                header->is_overflow = (overflow_idx > 0) ? 1 : 0;
+                header->overflow_slot_id = has_more ? (overflow_idx + 1) : 0;
+                
+                // Copy postings to chunk
+                CompactPosting* dest = reinterpret_cast<CompactPosting*>(chunk.data() + sizeof(PostingListHeader));
+                for (size_t i = 0; i < to_add; ++i) {
+                    dest[i].doc_id = postings[postings_added + i].first;
+                    dest[i].term_freq = postings[postings_added + i].second;
+                }
+                
+                // Insert chunk into BTree
+                std::span<uint8_t> keySpan(reinterpret_cast<uint8_t*>(const_cast<char*>(current_key.data())), current_key.size());
+                std::span<uint8_t> payloadSpan(chunk.data(), chunk.size());
+                term_btree_->insert(keySpan, payloadSpan);
+                
+                postings_added += to_add;
+                
+                // Prepare for next chunk if needed
+                if (has_more) {
+                    overflow_idx++;
+                    current_key = term;
+                    current_key.push_back('\0');
+                    current_key.append(reinterpret_cast<const char*>(&overflow_idx), sizeof(overflow_idx));
+                }
+            }
+            
             new_terms++;
         }
-        
-        // Add all postings for this term (already sorted by doc_id from Phase 1)
-        for (const auto& [doc_id, freq] : postings) {
-            list.add(doc_id, freq);
-        }
-        
-        // Save the complete posting list once
-        save_posting_list(term, list);
     }
     
     // Update statistics

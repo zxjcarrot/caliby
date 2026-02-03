@@ -107,7 +107,7 @@ using HnswIndexType = HNSW<hnsw_distance::SIMDAcceleratedL2>;
 // --- Python Module Definition ---
 PYBIND11_MODULE(caliby, m) {
     m.doc() = "Python bindings for the Calico Index(B-Tree, HNSW)";
-    m.attr("__version__") = "0.1.0.dev20260129183920";
+    m.attr("__version__") = "0.1.0.dev20260203030535";
     
     // Register cleanup function to be called at module unload
     auto cleanup = []() {
@@ -1447,15 +1447,20 @@ Examples:
                                   py::array_t<float, py::array::c_style | py::array::forcecast> query,
                                   const std::string& index_name,
                                   size_t k,
-                                  const std::string& filter_json) {
+                                  const std::string& filter_json,
+                                  size_t ef_search) {
             std::vector<float> q(query.data(), query.data() + query.size());
             std::optional<caliby::FilterCondition> filter;
             if (!filter_json.empty()) {
                 filter = caliby::FilterCondition::from_json(nlohmann::json::parse(filter_json));
             }
-            return self.search_vector(q, index_name, k, filter);
-        }, py::arg("query"), py::arg("index_name"), py::arg("k"), py::arg("filter") = "",
-        "Search for similar vectors. Optional filter as JSON string.")
+            nlohmann::json params;
+            if (ef_search > 0) {
+                params["ef_search"] = ef_search;
+            }
+            return self.search_vector(q, index_name, k, filter, params);
+        }, py::arg("query"), py::arg("index_name"), py::arg("k"), py::arg("filter") = "", py::arg("ef_search") = 100,
+        "Search for similar vectors. Optional filter as JSON string. ef_search controls search accuracy.")
         
         .def("search_text", [](caliby::Collection& self,
                                const std::string& query,

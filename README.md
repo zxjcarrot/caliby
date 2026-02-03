@@ -1,10 +1,18 @@
-# Caliby 🚀
+<p align="center">
+ <img src="docs/static/caliby_logo.png" alt="Caliby Logo" width="50%">
+</p>
 
-**The SQLite of Vector Databases — Embeddable, Fast, Larger-Than-Memory**
+<p align="center">
+  <a href="https://pypi.org/project/caliby/"><img src="https://img.shields.io/pypi/v/caliby.svg?logo=pypi" alt="PyPI Version"></a>
+<a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License"></a>
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Linux](https://img.shields.io/badge/platform-linux-lightgrey.svg)](https://www.linux.org/)
+<p align="center">
+  <!-- <strong>Memory Management Kit for Agents, Remember Me, Refine Me.</strong><br> -->
+  <em><sub>⭐ If you find Caliby useful, please consider giving it a star!</sub></em>
+</p>
+
+---
 
 Caliby is an **embeddable vector database** designed for AI applications that need to scale beyond available memory without the complexity of distributed systems. Unlike client-server vector databases that require separate infrastructure, Caliby runs directly inside your application for embedded use cases with rich features including document storage, vector search, and filtered search.
 
@@ -467,4 +475,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**⭐ If you find Caliby useful, please consider giving it a star!**

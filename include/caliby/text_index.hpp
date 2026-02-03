@@ -98,21 +98,33 @@ static_assert(sizeof(CompactPosting) == 10, "CompactPosting must be 10 bytes");
  * Format: [PostingListHeader][CompactPosting...][optional overflow chain pointer]
  */
 struct PostingListHeader {
-    uint32_t doc_freq;           // 4 bytes - Number of documents containing term  
-    uint32_t num_postings;       // 4 bytes - Number of postings in this chunk
-    uint32_t overflow_slot_id;   // 4 bytes - BTree slot ID for overflow (0 = none)
+    uint32_t doc_freq;           // 4 bytes - Total number of documents containing term (across all chunks)
+    uint32_t num_postings;       // 4 bytes - Number of postings currently stored in this chunk
+    uint32_t capacity;           // 4 bytes - Max number of postings this chunk can hold (pre-allocated space)
+    uint32_t overflow_slot_id;   // 4 bytes - Overflow chunk index (0 = none, >0 = has overflow)
     uint8_t  is_overflow;        // 1 byte  - 1 if this is an overflow chunk
     uint8_t  reserved[3];        // 3 bytes - Padding
 } __attribute__((packed));
 
-static_assert(sizeof(PostingListHeader) == 16, "PostingListHeader must be 16 bytes");
+static_assert(sizeof(PostingListHeader) == 20, "PostingListHeader must be 20 bytes");
+
+// Constants for append-only posting list optimization
+constexpr size_t INITIAL_POSTING_CAPACITY = 4;   // Initial capacity for new posting lists
+constexpr float POSTING_GROWTH_FACTOR = 1.3f;     // Growth factor when chunk is full
 
 /**
  * Calculate max postings that can fit in a given payload size.
  */
-inline constexpr size_t maxPostingsInPayload(size_t payloadSize) {
+inline size_t maxPostingsInPayload(size_t payloadSize) {
     if (payloadSize <= sizeof(PostingListHeader)) return 0;
     return (payloadSize - sizeof(PostingListHeader)) / sizeof(CompactPosting);
+}
+
+/**
+ * Calculate payload size needed for a given capacity.
+ */
+inline size_t payloadSizeForCapacity(size_t capacity) {
+    return sizeof(PostingListHeader) + capacity * sizeof(CompactPosting);
 }
 
 /**
@@ -412,6 +424,18 @@ private:
     void insert_or_update_posting(const std::string& term, uint64_t doc_id, uint16_t term_freq);
     PostingList load_posting_list(const std::string& term) const;
     void save_posting_list(const std::string& term, const PostingList& list);
+    
+    // Append-only posting list optimization
+    // Returns true if posting was appended in-place, false if full rebuild needed
+    bool append_posting(const std::string& term, uint64_t doc_id, uint16_t term_freq);
+    
+    // Batch append multiple postings for a single term efficiently
+    // Returns true if all postings were appended successfully, false if term didn't exist (new term)
+    bool append_postings_batch(const std::string& term, 
+                               const std::vector<std::pair<uint64_t, uint16_t>>& postings);
+    
+    // Create a new posting list chunk with pre-allocated capacity
+    std::vector<uint8_t> create_chunk_with_capacity(size_t capacity, uint32_t doc_freq);
 };
 
 } // namespace caliby

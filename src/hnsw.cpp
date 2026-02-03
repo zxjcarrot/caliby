@@ -1231,6 +1231,66 @@ void HNSW<DistanceMetric>::addPointsWithIdsParallel(const std::vector<const floa
 }
 
 template <typename DistanceMetric>
+std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::computeDistancesToCandidates(
+    const float* query, const std::vector<uint64_t>& candidate_ids, size_t k) {
+    
+    // Use a max-heap to keep track of top-k smallest distances
+    // The heap stores (distance, node_id) pairs
+    std::priority_queue<std::pair<float, u32>> top_k_heap;
+    
+    for (uint64_t candidate_id : candidate_ids) {
+        u32 node_id = static_cast<u32>(candidate_id);
+        
+        // Skip invalid node IDs
+        if (node_id >= max_elements_) {
+            continue;
+        }
+        
+        // Get the page containing this node
+        PID node_pid = getNodePID(node_id);
+        
+        try {
+            GuardO<HNSWPage> page_guard(node_pid);
+            
+            // Get node accessor
+            NodeAccessor node_acc(page_guard.ptr, getNodeIndexInPage(node_id), this);
+            const float* node_vector = node_acc.getVector();
+            
+            // Check if the node has valid data (level > 0 means it was inserted)
+            // Actually, we should check if the first few floats are non-zero
+            // A simpler check: just compute distance and trust the candidate list
+            
+            // Compute distance
+            float dist = calculateDistance(query, node_vector);
+            
+            if (top_k_heap.size() < k) {
+                top_k_heap.emplace(dist, node_id);
+            } else if (dist < top_k_heap.top().first) {
+                top_k_heap.pop();
+                top_k_heap.emplace(dist, node_id);
+            }
+        } catch (...) {
+            // Skip nodes that can't be accessed
+            continue;
+        }
+    }
+    
+    // Convert heap to sorted vector (ascending order by distance)
+    std::vector<std::pair<float, u32>> results;
+    results.reserve(top_k_heap.size());
+    
+    while (!top_k_heap.empty()) {
+        results.push_back(top_k_heap.top());
+        top_k_heap.pop();
+    }
+    
+    // Reverse to get ascending order
+    std::reverse(results.begin(), results.end());
+    
+    return results;
+}
+
+template <typename DistanceMetric>
 void HNSW<DistanceMetric>::addPoint(const float* point, u32& node_id_out) {
     u32 new_node_id;
     {

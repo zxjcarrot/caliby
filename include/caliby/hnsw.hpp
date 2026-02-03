@@ -262,6 +262,11 @@ class HNSW {
                                   const std::vector<uint32_t>& ids,
                                   size_t num_threads = 0);
 
+    // Compute distances from query to specific candidate IDs (for pre-filtering).
+    // Returns vector of (distance, node_id) pairs sorted by distance (ascending).
+    std::vector<std::pair<float, u32>> computeDistancesToCandidates(
+        const float* query, const std::vector<uint64_t>& candidate_ids, size_t k);
+
     HNSW(const HNSW&) = delete;
     HNSW& operator=(const HNSW&) = delete;
     HNSW(HNSW&&) = delete;
