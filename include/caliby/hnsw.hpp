@@ -200,6 +200,7 @@ class HNSW {
     u64 max_elements_;
     double mult_factor;
     bool enable_prefetch_;
+    bool optimizations_enabled_;                  // HeapCand + BFS + ThreadLocalCache
     std::vector<u32> new_to_old_;                // BFS layout: internal→original mapping
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
     bool recovered_from_disk_ = false;
@@ -223,7 +224,8 @@ class HNSW {
    public:
     // Constructor with runtime parameters
     HNSW(u64 max_elements, size_t dim, size_t M = 16, size_t ef_construction = 200, bool enable_prefetch = true,
-        bool skip_recovery = false, uint32_t index_id = 0, const std::string& name = "");
+        bool skip_recovery = false, uint32_t index_id = 0, const std::string& name = "",
+        bool enable_optimizations = true);
     // Destructor - must be defined in .cpp where ThreadPool is complete
     ~HNSW();
     

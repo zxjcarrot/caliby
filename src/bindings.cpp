@@ -251,14 +251,10 @@ PYBIND11_MODULE(caliby, m) {
         py::class_<HnswIndexType>(m, "HnswIndex")
                 .def(py::init([](u64 max_elements, size_t dim, size_t M, size_t ef_construction,
                                 bool enable_prefetch, bool skip_recovery, uint32_t index_id,
-                                const std::string& name) {
-                    // Ensure system is initialized before creating index
+                                const std::string& name, bool enable_optimizations) {
                     initialize_system();
-                    
                     uint32_t final_index_id = index_id;
                     std::string final_name = name;
-                    
-                    // If index_id is 0 and catalog is initialized, create a catalog entry
                     caliby::IndexCatalog& catalog = caliby::IndexCatalog::instance();
                     if (final_index_id == 0 && catalog.is_initialized()) {
                         // Generate a name if not provided
@@ -278,7 +274,8 @@ PYBIND11_MODULE(caliby, m) {
                     }
                     
                     return new HnswIndexType(max_elements, dim, M, ef_construction,
-                                           enable_prefetch, skip_recovery, final_index_id, final_name);
+                                           enable_prefetch, skip_recovery, final_index_id, final_name,
+                                           enable_optimizations);
                 }),
                          py::arg("max_elements"),
                          py::arg("dim") = HNSW_DIM,
@@ -288,6 +285,7 @@ PYBIND11_MODULE(caliby, m) {
                          py::arg("skip_recovery") = false,
                          py::arg("index_id") = 0,
                          py::arg("name") = "",
+                         py::arg("enable_optimizations") = true,
                          "Initializes a new, empty HNSW index with runtime parameters. Set skip_recovery to True to rebuild the index from scratch. index_id is used for multi-index isolation. name is an optional identifier for the index. "
                          "If caliby.open() was called and index_id is 0, the index will be automatically registered with the catalog.")
         .def(

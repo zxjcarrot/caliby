@@ -95,7 +95,8 @@ size_t HNSW<DistanceMetric>::estimateMaxLevel(u64 max_elements, size_t M) {
 // --- HNSW Constructor Implementation ---
 template <typename DistanceMetric>
 HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t ef_construction_param,
-                           bool enable_prefetch_param, bool skip_recovery_param, uint32_t index_id, const std::string& name)
+                           bool enable_prefetch_param, bool skip_recovery_param, uint32_t index_id, const std::string& name,
+                           bool enable_optimizations)
         : index_id_(index_id),
           name_(name),
           Dim(dim),
@@ -109,7 +110,8 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
           FixedNodeSize(VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize),
           MaxNodesPerPage((pageSize - HNSWPage::HeaderSize) / FixedNodeSize),
           NodesPerPage(MaxNodesPerPage),
-          enable_prefetch_(enable_prefetch_param) {
+          enable_prefetch_(enable_prefetch_param),
+          optimizations_enabled_(enable_optimizations) {
     if (Dim == 0) {
         throw std::runtime_error("HNSW dimension must be greater than zero.");
     }
@@ -2117,6 +2119,7 @@ std::string HNSW<DistanceMetric>::getIndexInfo() const {
 
 template <typename DistanceMetric>
 void HNSW<DistanceMetric>::optimize_layout() {
+    if (!optimizations_enabled_) return;  // ablation switch
     IndexTranslationArray* index_array = bm.getIndexArray(index_id_);
     u64 node_count = 0;
 
