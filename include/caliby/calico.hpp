@@ -303,6 +303,20 @@ struct IOUringInterface: public IOInterface {
 };
 #endif
 
+#define CALICO_LIKELY(x) __builtin_expect(!!(x), 1)
+struct ThreadLocalFrameCache {
+    u32* local_free = nullptr;
+    u32 local_free_count = 0, local_free_capacity = 0;
+    std::atomic<u64> alloc_count{0}, free_count{0}, batch_refill_count{0}, batch_drain_count{0};
+    bool initialized = false;
+    static constexpr u32 LOCAL_CACHE_SIZE = 64, BATCH_TRANSFER_SIZE = 32;
+    void initialize() { if (!initialized) { local_free = new u32[LOCAL_CACHE_SIZE]; local_free_capacity = LOCAL_CACHE_SIZE; local_free_count = 0; initialized = true; } }
+    ~ThreadLocalFrameCache() { delete[] local_free; }
+    inline bool tryAllocLocal(u32& f) { if (CALICO_LIKELY(local_free_count > 0)) { f = local_free[--local_free_count]; alloc_count.fetch_add(1, std::memory_order_relaxed); return true; } return false; }
+    inline bool tryFreeLocal(u32 f) { if (CALICO_LIKELY(local_free_count < local_free_capacity)) { local_free[local_free_count++] = f; free_count.fetch_add(1, std::memory_order_relaxed); return true; } return false; }
+};
+extern thread_local ThreadLocalFrameCache tl_frame_cache;
+
 struct FreePartition {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
     std::vector<u32> frames;
@@ -758,7 +772,9 @@ struct BufferManager {
     Page* handleFault(PID pid);
     void readPage(PID pid, Page* dest);
     void evict();
-    void forceEvictPortion(float portion = 0.5);  // Force eviction of a portion of buffer pool for testing
+    void forceEvictPortion(float portion = 0.5);
+    void refillThreadLocalCache();
+    void drainThreadLocalCache();
     void prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
     void prefetchPagesSingleLevel(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
     void prefetchPages2Level(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);

@@ -294,6 +294,8 @@ PYBIND11_MODULE(caliby, m) {
             "flush",
             [](HnswIndexType&) { flush_system(); },
             "Flushes all dirty pages managed by Calico to persistent storage.")
+        .def("optimize_layout", &HnswIndexType::optimize_layout,
+             "BFS-based layout optimization for better cache locality during search.")
         .def("was_recovered", &HnswIndexType::wasRecovered,
              "Returns True if the underlying index state was recovered from existing storage.")
         .def("get_name", &HnswIndexType::getName,
