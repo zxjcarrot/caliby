@@ -200,6 +200,8 @@ class HNSW {
     u64 max_elements_;
     double mult_factor;
     bool enable_prefetch_;
+    bool optimizations_enabled_;                  // HeapCand + BFS + ThreadLocalCache
+    std::vector<u32> new_to_old_;                // BFS layout: internal→original mapping
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
     bool recovered_from_disk_ = false;
     
@@ -222,7 +224,8 @@ class HNSW {
    public:
     // Constructor with runtime parameters
     HNSW(u64 max_elements, size_t dim, size_t M = 16, size_t ef_construction = 200, bool enable_prefetch = true,
-        bool skip_recovery = false, uint32_t index_id = 0, const std::string& name = "");
+        bool skip_recovery = false, uint32_t index_id = 0, const std::string& name = "",
+        bool enable_optimizations = true);
     // Destructor - must be defined in .cpp where ThreadPool is complete
     ~HNSW();
     
@@ -244,6 +247,15 @@ class HNSW {
     // Add a point with a specific node_id (e.g., doc_id). 
     // The caller is responsible for ensuring node_id is unique and within max_elements.
     void addPointWithId(const float* point, u32 node_id);
+
+    // BFS-based layout optimization: reorders nodes for cache locality.
+    void optimize_layout();
+
+    // Map BFS-internal ID back to original (insertion-order) ID.
+    // Returns node_id unchanged if layout hasn't been optimized.
+    u32 internal_to_external(u32 internal_id) const {
+        return (internal_id < new_to_old_.size()) ? new_to_old_[internal_id] : internal_id;
+    }
 
     // Search for the K nearest neighbors for a single query.
     template <bool stats = false>

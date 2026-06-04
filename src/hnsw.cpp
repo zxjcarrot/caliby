@@ -6,8 +6,40 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <functional>
 #include <future>
+
+// --- Custom inline heap (faster than std::priority_queue) ---
+namespace {
+struct HeapCand { float dist; u32 id; };
+inline void push_min_heap(std::vector<HeapCand>& h, HeapCand v) noexcept {
+    h.push_back(v); size_t hole = h.size()-1;
+    while (hole > 0) { size_t p = (hole-1)>>1; if (h[p].dist <= v.dist) break; h[hole] = h[p]; hole = p; }
+    h[hole] = v;
+}
+inline HeapCand pop_min_heap(std::vector<HeapCand>& h) noexcept {
+    HeapCand r = h.front(), v = h.back(); h.pop_back();
+    if (!h.empty()) { size_t len = h.size(), hole = 0, child = 1;
+        while (child < len) { size_t right = child+1;
+            if (right < len && h[right].dist < h[child].dist) child = right;
+            if (h[child].dist >= v.dist) break; h[hole] = h[child]; hole = child; child = (hole<<1)+1; }
+        h[hole] = v; }
+    return r;
+}
+inline void push_max_heap(std::vector<HeapCand>& h, HeapCand v) noexcept {
+    h.push_back(v); size_t hole = h.size()-1;
+    while (hole > 0) { size_t p = (hole-1)>>1; if (h[p].dist >= v.dist) break; h[hole] = h[p]; hole = p; }
+    h[hole] = v;
+}
+inline void replace_top_max_heap(std::vector<HeapCand>& h, HeapCand v) noexcept {
+    size_t len = h.size(), hole = 0, child = 1;
+    while (child < len) { size_t right = child+1;
+        if (right < len && h[right].dist > h[child].dist) child = right;
+        if (h[child].dist <= v.dist) break; h[hole] = h[child]; hole = child; child = (hole<<1)+1; }
+    h[hole] = v;
+}
+}  // namespace
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -63,7 +95,8 @@ size_t HNSW<DistanceMetric>::estimateMaxLevel(u64 max_elements, size_t M) {
 // --- HNSW Constructor Implementation ---
 template <typename DistanceMetric>
 HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t ef_construction_param,
-                           bool enable_prefetch_param, bool skip_recovery_param, uint32_t index_id, const std::string& name)
+                           bool enable_prefetch_param, bool skip_recovery_param, uint32_t index_id, const std::string& name,
+                           bool enable_optimizations)
         : index_id_(index_id),
           name_(name),
           Dim(dim),
@@ -77,7 +110,8 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
           FixedNodeSize(VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize),
           MaxNodesPerPage((pageSize - HNSWPage::HeaderSize) / FixedNodeSize),
           NodesPerPage(MaxNodesPerPage),
-          enable_prefetch_(enable_prefetch_param) {
+          enable_prefetch_(enable_prefetch_param),
+          optimizations_enabled_(enable_optimizations) {
     if (Dim == 0) {
         throw std::runtime_error("HNSW dimension must be greater than zero.");
     }
@@ -425,19 +459,19 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
     // Get IndexTranslationArray once for this index to avoid TLS lookups in tight loop
     IndexTranslationArray* index_array = bm.getIndexArray(index_id_);
     
-    std::priority_queue<std::pair<float, u32>> top_candidates; // Max-heap to keep the best results
-    std::priority_queue<std::pair<float, u32>, std::vector<std::pair<float, u32>>, std::greater<std::pair<float, u32>>>
-        candidate_queue; // Min-heap to explore candidates
-    
+    std::vector<HeapCand> top_candidates;
+    std::vector<HeapCand> candidate_queue;
+    top_candidates.reserve(ef); candidate_queue.reserve(ef * 2);
+    float lower_bound = std::numeric_limits<float>::max();
 
     // --- Use pre-calculated distance if available ---
     if (initial_entry_dist_pair && initial_entry_dist_pair->second == entry_point_id) {
         float dist = initial_entry_dist_pair->first;
-        top_candidates.push({dist, entry_point_id});
-        candidate_queue.push({dist, entry_point_id});
+        push_max_heap(top_candidates, {dist, entry_point_id});
+        push_min_heap(candidate_queue, {dist, entry_point_id});
+        lower_bound = dist;
         visited_array[entry_point_id] = visited_array_tag;
     } else {
-        // Fallback: calculate distance if not provided or if IDs don't match
         for (;;) {
             float dist;
             try {
@@ -447,17 +481,12 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
                 GuardORelaxed<HNSWPage> page_guard(getNodePID(entry_point_id), index_array);
                 #endif
                 NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(entry_point_id), this);
-                
-                if (stats) {
-                    dist = this->calculateDistance(query, acc.getVector());
-                } else {
-                    dist = DistanceMetric::compare(query, acc.getVector(), Dim);
-                }
-            } catch (const OLCRestartException&) {
-                continue;
-            }
-            top_candidates.push({dist, entry_point_id});
-            candidate_queue.push({dist, entry_point_id});
+                if (stats) dist = this->calculateDistance(query, acc.getVector());
+                else dist = DistanceMetric::compare(query, acc.getVector(), Dim);
+            } catch (const OLCRestartException&) { continue; }
+            push_max_heap(top_candidates, {dist, entry_point_id});
+            push_min_heap(candidate_queue, {dist, entry_point_id});
+            lower_bound = dist;
             visited_array[entry_point_id] = visited_array_tag;
             break;
         }
@@ -471,17 +500,10 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
     
     std::vector<u32> unvisited_neighbors;
     while (!candidate_queue.empty()) {
-        auto current_pair = candidate_queue.top();
-        candidate_queue.pop();
+        auto [cand_dist, current_id] = pop_min_heap(candidate_queue);
 
-        if (top_candidates.size() >= ef && current_pair.first > top_candidates.top().first) {
-            break; // All further candidates are worse than the worst in our result set.
-        }
-        
-        if (stats) {
-            stats_.search_hops.fetch_add(1, std::memory_order_relaxed);
-        }
-        u32 current_id = current_pair.second;
+        if (top_candidates.size() >= ef && cand_dist > top_candidates.front().dist) break;
+        if (stats) stats_.search_hops.fetch_add(1, std::memory_order_relaxed);
         try {
             //GuardS<HNSWPage> current_page_guard(getNodePID(current_id));
             GuardO<HNSWPage> current_page_guard(getNodePID(current_id), index_array);
@@ -606,20 +628,19 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
                     continue;
                 }
 
-                if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
-                    // prefetch l0 neighbor data
-                    //_mm_prefetch(neighbor_page_guard.ptr->getNodeData() + NodeAccessor::getL0NeighborOffset(this, neighbor_id), _MM_HINT_T0);
-
-                    candidate_queue.push({neighbor_dist, neighbor_id});
-                    top_candidates.push({neighbor_dist, neighbor_id});
-                    if (top_candidates.size() > ef) {
-                        top_candidates.pop();
+                if (neighbor_dist < lower_bound || top_candidates.size() < ef) {
+                    push_min_heap(candidate_queue, {neighbor_dist, neighbor_id});
+                    if (top_candidates.size() < ef) {
+                        push_max_heap(top_candidates, {neighbor_dist, neighbor_id});
+                    } else if (neighbor_dist < top_candidates.front().dist) {
+                        replace_top_max_heap(top_candidates, {neighbor_dist, neighbor_id});
                     }
+                    if (top_candidates.size() >= ef) lower_bound = top_candidates.front().dist;
                 }
                 visited_array[neighbor_id] = visited_array_tag;
             }
         } catch (const OLCRestartException&) {
-            candidate_queue.push(current_pair); // Re-insert to retry later
+            push_min_heap(candidate_queue, {cand_dist, current_id});
             continue; // Skip this node if it was modified concurrently.
             //std::cout << "OLCRestartException caught in searchLayer" << std::endl;
         }
@@ -627,11 +648,9 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
 
     std::vector<std::pair<float, u32>> results;
     results.reserve(top_candidates.size());
-    while (!top_candidates.empty()) {
-        results.push_back(top_candidates.top());
-        top_candidates.pop();
-    }
-    std::reverse(results.begin(), results.end());
+    std::sort(top_candidates.begin(), top_candidates.end(),
+              [](const HeapCand& a, const HeapCand& b) { return a.dist < b.dist; });
+    for (auto& hc : top_candidates) results.emplace_back(hc.dist, hc.id);
     visited_list_pool_->releaseVisitedList(visited_nodes);
     return results;
 }
@@ -1940,6 +1959,11 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchKnn(const float* 
     if (candidates.size() > k) {
         candidates.resize(k);
     }
+    // Remap BFS-internal IDs back to original (insertion-order) IDs
+    if (!new_to_old_.empty()) {
+        for (auto& p : candidates)
+            p.second = internal_to_external(p.second);
+    }
     return candidates;
 }
 
@@ -2091,6 +2115,119 @@ std::string HNSW<DistanceMetric>::getIndexInfo() const {
     info << "\n=== End Index Information ===\n";
 
     return info.str();
+}
+
+template <typename DistanceMetric>
+void HNSW<DistanceMetric>::optimize_layout() {
+    if (!optimizations_enabled_) return;  // ablation switch
+    IndexTranslationArray* index_array = bm.getIndexArray(index_id_);
+    u64 node_count = 0;
+
+    // Get entry point and node count from metadata
+    u32 entry_point = 0;
+    try {
+        GuardO<HNSWMetadataPage> meta_guard(metadata_pid);
+        node_count = meta_guard->node_count.load(std::memory_order_acquire);
+        entry_point = meta_guard->enter_point_node_id;
+    } catch (const OLCRestartException&) { return; }
+    if (node_count == 0) return;
+
+    // Phase 1: BFS ordering
+    std::vector<u32> new_to_old(node_count);
+    std::vector<int32_t> old_to_new(node_count, -1);
+    std::vector<u8> visited(node_count, 0);
+    std::vector<u32> queue; queue.reserve(node_count);
+    u32 bfs_count = 0;
+
+    if (entry_point < node_count) { queue.push_back(entry_point); visited[entry_point] = 1; }
+    for (size_t qh = 0; qh < queue.size(); ++qh) {
+        u32 cur = queue[qh];
+        new_to_old[bfs_count] = cur;
+        old_to_new[cur] = static_cast<int32_t>(bfs_count);
+        ++bfs_count;
+        try {
+            GuardORelaxed<HNSWPage> pg(getNodePID(cur), index_array);
+            NodeAccessor acc(pg.ptr, getNodeIndexInPage(cur), this);
+            auto nb = acc.getNeighbors(0, this);
+            for (u32 nid : nb)
+                if (nid < node_count && !visited[nid]) { visited[nid] = 1; queue.push_back(nid); }
+        } catch (const OLCRestartException&) {}
+    }
+    for (u32 i = 0; i < node_count; ++i)
+        if (!visited[i]) { new_to_old[bfs_count] = i; old_to_new[i] = static_cast<int32_t>(bfs_count); ++bfs_count; }
+
+    // Save copies for later phases (new_to_old will be moved to member)
+    auto n2o_copy = new_to_old;  // Phase 4 needs this
+    new_to_old_ = std::move(new_to_old);
+
+    // Phase 2: Read all nodes into temp buffer
+    u8* buf = static_cast<u8*>(std::malloc(node_count * FixedNodeSize));
+    if (!buf) return;
+    for (u32 old_id = 0; old_id < node_count; ++old_id) {
+        for (;;) {
+            try {
+                GuardO<HNSWPage> pg(getNodePID(old_id), index_array);
+                u32 idx = getNodeIndexInPage(old_id);
+                memcpy(buf + static_cast<u64>(old_id) * FixedNodeSize,
+                       pg.ptr->getNodeData() + idx * FixedNodeSize, FixedNodeSize);
+                break;
+            } catch (const OLCRestartException&) {}
+        }
+    }
+
+    // Phase 3: Remap all neighbor IDs (old → new)
+    u64 remapped_count = 0;
+    for (u32 old_id = 0; old_id < node_count; ++old_id) {
+        u8* node = buf + static_cast<u64>(old_id) * FixedNodeSize;
+        u16* counts = reinterpret_cast<u16*>(node + VectorSize);
+        const u32* nb_all = reinterpret_cast<const u32*>(node + VectorSize + MaxNeighborsHeaderSize);
+        for (u32 lv = 0; lv < MaxLevel; ++lv) {
+            u16 n = counts[lv];
+            if (n == 0) continue;
+            u32 off = (lv == 0) ? 0 : (M0 + (lv - 1) * static_cast<u32>(M));
+            u32* nb = const_cast<u32*>(nb_all + off);
+            for (u16 j = 0; j < n; ++j) {
+                u32 old_nb = nb[j];
+                if (old_nb < node_count && old_to_new[old_nb] >= 0) {
+                    nb[j] = static_cast<u32>(old_to_new[old_nb]);
+                    ++remapped_count;
+                }
+            }
+        }
+    }
+
+    // Phase 4: Write back in BFS order
+    for (u32 new_pos = 0; new_pos < node_count; ++new_pos) {
+        u32 old_id = n2o_copy[new_pos];
+        PID pid = getNodePID(new_pos);
+        u32 idx = getNodeIndexInPage(new_pos);
+        GuardX<HNSWPage> pg(pid);
+        memcpy(pg.ptr->getNodeData() + idx * FixedNodeSize,
+               buf + static_cast<u64>(old_id) * FixedNodeSize, FixedNodeSize);
+        pg.ptr->dirty = true;
+    }
+
+    // Update entry point
+    if (entry_point < node_count && old_to_new[entry_point] >= 0) {
+        GuardX<HNSWMetadataPage> meta_guard(metadata_pid);
+        meta_guard->enter_point_node_id = static_cast<u32>(old_to_new[entry_point]);
+        meta_guard->dirty = true;
+    }
+
+    // Verify: read back a few nodes and check neighbor IDs are valid
+    u32 bad_refs = 0, total_refs = 0;
+    for (u32 pos = 0; pos < std::min<u32>(10, node_count); ++pos) {
+        try {
+            GuardORelaxed<HNSWPage> pg(getNodePID(pos), index_array);
+            NodeAccessor acc(pg.ptr, getNodeIndexInPage(pos), this);
+            auto nb = acc.getNeighbors(0, this);
+            for (u32 nid : nb) { ++total_refs; if (nid >= node_count) ++bad_refs; }
+        } catch (...) {}
+    }
+    CALIBY_LOG_INFO("HNSW", "BFS done: ", bfs_count, " nodes, ", remapped_count, " remapped, verify: ", bad_refs, "/", total_refs, " bad refs");
+
+    std::free(buf);
+    CALIBY_LOG_INFO("HNSW", "BFS layout optimized for ", node_count, " nodes");
 }
 
 // --- Explicit Template Instantiation ---

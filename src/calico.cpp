@@ -1391,19 +1391,44 @@ static thread_local u32 freePartitionCursor = []() -> u32 {
     return static_cast<u32>(h % BufferManager::freePartitionCount);
 }();
 
+thread_local ThreadLocalFrameCache tl_frame_cache;
+
+void BufferManager::refillThreadLocalCache() {
+    if (!tl_frame_cache.initialized) tl_frame_cache.initialize();
+    u32 n = 0, target = std::min(ThreadLocalFrameCache::LOCAL_CACHE_SIZE - tl_frame_cache.local_free_count, ThreadLocalFrameCache::BATCH_TRANSFER_SIZE);
+    for (u32 a = 0; a < freePartitionCount && n < target; ++a) {
+        u32 pi = (freePartitionCursor + a) % freePartitionCount;
+        auto& part = freePartitions[pi];
+        lockPartition(pi);
+        while (part.top > 0 && n < target && tl_frame_cache.local_free_count < tl_frame_cache.local_free_capacity)
+            tl_frame_cache.local_free[tl_frame_cache.local_free_count++] = part.frames[--part.top], ++n;
+        unlockPartition(pi);
+        if (n > 0) { freePartitionCursor = (pi + 1) % freePartitionCount; tl_frame_cache.batch_refill_count.fetch_add(1, std::memory_order_relaxed); }
+    }
+}
+
+void BufferManager::drainThreadLocalCache() {
+    while (tl_frame_cache.local_free_count > ThreadLocalFrameCache::LOCAL_CACHE_SIZE / 2) {
+        u32 f = tl_frame_cache.local_free[--tl_frame_cache.local_free_count];
+        u32 pi = partitionForFrame(f);
+        lockPartition(pi);
+        if (freePartitions[pi].top < freePartitions[pi].frames.size()) freePartitions[pi].frames[freePartitions[pi].top++] = f;
+        unlockPartition(pi);
+    }
+}
+
 u32 BufferManager::popFreeFrame() {
+    if (!tl_frame_cache.initialized) tl_frame_cache.initialize();
+    u32 f;
+    if (tl_frame_cache.tryAllocLocal(f)) return f;
+    refillThreadLocalCache();
+    if (tl_frame_cache.tryAllocLocal(f)) return f;
     for (u32 attempt = 0; attempt < freePartitionCount; ++attempt) {
         u32 partition = (freePartitionCursor + attempt) % freePartitionCount;
         auto& part = freePartitions[partition];
         if (part.frames.empty()) continue;
-
         lockPartition(partition);
-        if (part.top > 0) {
-            u32 frame = part.frames[--part.top];
-            unlockPartition(partition);
-            freePartitionCursor = (partition + 1) % freePartitionCount;
-            return frame;
-        }
+        if (part.top > 0) { f = part.frames[--part.top]; unlockPartition(partition); freePartitionCursor = (partition + 1) % freePartitionCount; return f; }
         unlockPartition(partition);
     }
     throw std::runtime_error("no free frames available");
