@@ -646,14 +646,14 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
         // Initialize fresh
         if (has_existing_meta) {
             meta_info->valid = 0;
-            meta_page_guard->dirty = true;
+            markPageDirty(meta_page_guard);
             CALIBY_LOG_INFO("IVFPQ", "Recovery: Existing metadata invalidated for rebuild");
         }
         
         // Allocate metadata page
         AllocGuard<IVFPQMetadataPage> metadata_guard(allocator_);
         metadata_pid_ = metadata_guard.pid;
-        metadata_guard->dirty = true;
+        markPageDirty(metadata_guard);
         metadata_guard->dim = dim_;
         metadata_guard->num_clusters = num_clusters_;
         metadata_guard->num_subquantizers = num_subquantizers_;
@@ -670,12 +670,12 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
         {
             AllocGuard<CentroidPage> first_centroid_guard(allocator_);
             centroids_base_pid_ = first_centroid_guard.pid;
-            first_centroid_guard->dirty = true;
+            markPageDirty(first_centroid_guard);
             first_centroid_guard->centroid_count = 0;
             
             for (u32 i = 1; i < centroid_pages_; ++i) {
                 AllocGuard<CentroidPage> page_guard(allocator_);
-                page_guard->dirty = true;
+                markPageDirty(page_guard);
                 page_guard->centroid_count = 0;
             }
         }
@@ -684,7 +684,7 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
         {
             AllocGuard<InvListDirPage> first_dir_guard(allocator_);
             invlist_dir_base_pid_ = first_dir_guard.pid;
-            first_dir_guard->dirty = true;
+            markPageDirty(first_dir_guard);
             first_dir_guard->entry_count = std::min(entries_per_dir_page_, num_clusters_);
             first_dir_guard->first_cluster_id = 0;
             // Initialize entries
@@ -694,7 +694,7 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
             
             for (u32 i = 1; i < dir_pages_; ++i) {
                 AllocGuard<InvListDirPage> page_guard(allocator_);
-                page_guard->dirty = true;
+                markPageDirty(page_guard);
                 u32 start_cluster = i * entries_per_dir_page_;
                 u32 count = std::min(entries_per_dir_page_, num_clusters_ - start_cluster);
                 page_guard->entry_count = count;
@@ -713,7 +713,7 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
                     if (sq == 0 && page_idx == 0) {
                         codebook_base_pid_ = page_guard.pid;
                     }
-                    page_guard->dirty = true;
+                    markPageDirty(page_guard);
                     page_guard->subquantizer_id = sq;
                     page_guard->subvector_dim = subvector_dim_;
                     page_guard->page_index = page_idx;
@@ -745,7 +745,7 @@ IVFPQ<DistanceMetric>::IVFPQ(u64 max_elements, size_t dim, u32 num_clusters,
         meta_info->last_train_count.store(0, std::memory_order_relaxed);
         meta_info->retrain_interval = retrain_interval_;
         meta_info->is_trained = 0;
-        meta_page_guard->dirty = true;
+        markPageDirty(meta_page_guard);
         
         CALIBY_LOG_INFO("IVFPQ", "Recovery: Allocated new index. metadata_pid=", metadata_pid_, " centroids_base=", centroids_base_pid_, " invlist_dir_base=", invlist_dir_base_pid_, " codebook_base=", codebook_base_pid_);
     }
@@ -1046,7 +1046,7 @@ void IVFPQ<DistanceMetric>::trainPQCodebooks(const float* vectors, u64 n) {
         for (u32 page_idx = 0; page_idx < codebook_pages_per_subq_; ++page_idx) {
             PID page_pid = codebook_base_pid_ + m * codebook_pages_per_subq_ + page_idx;
             GuardX<PQCodebookPage> cb_guard(page_pid);
-            cb_guard->dirty = true;
+            markPageDirty(cb_guard);
             cb_guard->subquantizer_id = m;
             cb_guard->subvector_dim = subvector_dim_;
             cb_guard->page_index = page_idx;
@@ -1092,7 +1092,7 @@ void IVFPQ<DistanceMetric>::train(const float* training_vectors, u64 n_train, u3
     // Write centroids to disk
     for (u32 page_idx = 0; page_idx < centroid_pages_; ++page_idx) {
         GuardX<CentroidPage> page_guard(centroids_base_pid_ + page_idx);
-        page_guard->dirty = true;
+        markPageDirty(page_guard);
         
         u32 start_c = page_idx * centroids_per_page_;
         u32 end_c = std::min(start_c + centroids_per_page_, num_clusters_);
@@ -1126,7 +1126,7 @@ void IVFPQ<DistanceMetric>::train(const float* training_vectors, u64 n_train, u3
     
     // Update metadata
     GuardX<IVFPQMetadataPage> meta_guard(metadata_pid_);
-    meta_guard->dirty = true;
+    markPageDirty(meta_guard);
     meta_guard->is_trained.store(1, std::memory_order_release);
     meta_guard->last_train_count.store(0, std::memory_order_release);
     
@@ -1140,7 +1140,7 @@ void IVFPQ<DistanceMetric>::train(const float* training_vectors, u64 n_train, u3
         GuardX<MetaDataPage> global_meta_guard(global_metadata_page_id);
         IVFPQMetaInfo* meta_info = reinterpret_cast<IVFPQMetaInfo*>(&global_meta_guard.ptr->ivfpq_meta);
         meta_info->is_trained = 1;
-        global_meta_guard->dirty = true;
+        markPageDirty(global_meta_guard);
     }
     
     // Invalidate cache
@@ -1533,7 +1533,7 @@ void IVFPQ<DistanceMetric>::appendToInvList(u32 cluster_id, u32 vector_id, const
                 pq_entry->original_id = vector_id;
                 std::memcpy(pq_entry->getCodes(), pq_codes, num_subquantizers_);
                 last_page_guard->count++;
-                last_page_guard->dirty = true;
+                markPageDirty(last_page_guard);
             }
         }
     }
@@ -1557,7 +1557,7 @@ void IVFPQ<DistanceMetric>::appendToInvList(u32 cluster_id, u32 vector_id, const
         new_page_guard->next_page = BufferManager::invalidPID;
         new_page_guard->count = 1;
         new_page_guard->capacity = entries_per_invlist_page_;
-        new_page_guard->dirty = true;
+        markPageDirty(new_page_guard);
         
         // Write entry
         PQCodeEntry* pq_entry = new_page_guard->getEntry(0, pq_entry_size_);
@@ -1570,16 +1570,16 @@ void IVFPQ<DistanceMetric>::appendToInvList(u32 cluster_id, u32 vector_id, const
             
             GuardX<InvListDataPage> prev_last_guard(prev_last_pid);
             prev_last_guard->next_page = new_page_pid;
-            prev_last_guard->dirty = true;
+            markPageDirty(prev_last_guard);
             
             // Update directory entry
             entry->last_page_pid = new_page_pid;
-            dir_guard->dirty = true;
+            markPageDirty(dir_guard);
         } else {
             // First page
             entry->first_page_pid = new_page_pid;
             entry->last_page_pid = new_page_pid;
-            dir_guard->dirty = true;
+            markPageDirty(dir_guard);
         }
         
         // Update cached pages for prefetching
@@ -1593,7 +1593,7 @@ void IVFPQ<DistanceMetric>::appendToInvList(u32 cluster_id, u32 vector_id, const
     
     entry->list_size.fetch_add(1, std::memory_order_relaxed);
     // Ensure directory page is marked dirty (may already be set above, but doesn't hurt)
-    dir_guard->dirty = true;
+    markPageDirty(dir_guard);
 }
 
 // --- Add Point ---
@@ -1631,7 +1631,7 @@ void IVFPQ<DistanceMetric>::addPoint(const float* vector, u32 vector_id) {
     // Update count
     GuardX<IVFPQMetadataPage> meta_guard(metadata_pid_);
     u64 new_count = meta_guard->num_vectors.fetch_add(1, std::memory_order_relaxed) + 1;
-    meta_guard->dirty = true;
+    markPageDirty(meta_guard);
     
     // Check if retraining is needed
     u64 last_train = meta_guard->last_train_count.load(std::memory_order_relaxed);
@@ -1724,7 +1724,7 @@ void IVFPQ<DistanceMetric>::addPoints(const float* vectors, const u32* ids, u64 
     // =========================================================================
     GuardX<IVFPQMetadataPage> meta_guard(metadata_pid_);
     u64 new_count = meta_guard->num_vectors.fetch_add(count, std::memory_order_relaxed) + count;
-    meta_guard->dirty = true;
+    markPageDirty(meta_guard);
     
     // Check if retraining is needed
     u64 last_train = meta_guard->last_train_count.load(std::memory_order_relaxed);

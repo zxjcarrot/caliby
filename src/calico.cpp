@@ -1,6 +1,7 @@
 #include "calico.hpp"
 #include "catalog.hpp"
 #include "logging.hpp"
+#include "recovery/log_manager.hpp"
 
 #include <errno.h>
 #include <cstring>
@@ -70,16 +71,6 @@ uint64_t rdtsc() {
     return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
 }
 
-// exmap helper function
-static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
-    struct exmap_action_params params_free = {
-        .interface = workerThreadId,
-        .iov_len = len,
-        .opcode = (u16)op,
-    };
-    return ioctl(exmapfd, EXMAP_IOCTL_ACTION, &params_free);
-}
-
 // Calculate minimal number of bits needed to represent n
 static u32 bitsNeeded(u64 n) {
     if (n == 0) return 1;
@@ -92,24 +83,24 @@ static u32 bitsNeeded(u64 n) {
 
 void IndexCatalog::registerIndex(u32 index_id, u64 max_pages, int file_fd) {
     std::unique_lock<std::shared_mutex> lock(mutex);
-    
+
     auto it = entries.find(index_id);
     if (it != entries.end()) {
         // Already registered
         return;
     }
-    
+
     IndexEntry entry(index_id, max_pages);
     entry.file_fd = file_fd;
     entries[index_id] = std::move(entry);
-    
-    CALIBY_LOG_DEBUG("IndexCatalog", "Registered index ", index_id, 
+
+    CALIBY_LOG_DEBUG("IndexCatalog", "Registered index ", index_id,
                      " with max_pages=", max_pages);
 }
 
 void IndexCatalog::updateAllocCount(u32 index_id, u64 count) {
     std::shared_lock<std::shared_mutex> lock(mutex);
-    
+
     auto it = entries.find(index_id);
     if (it != entries.end()) {
         u64 current = it->second.alloc_count.load(std::memory_order_relaxed);
@@ -121,7 +112,7 @@ void IndexCatalog::updateAllocCount(u32 index_id, u64 count) {
 
 u64 IndexCatalog::getAllocCount(u32 index_id) const {
     std::shared_lock<std::shared_mutex> lock(mutex);
-    
+
     auto it = entries.find(index_id);
     if (it != entries.end()) {
         return it->second.alloc_count.load(std::memory_order_acquire);
@@ -131,7 +122,7 @@ u64 IndexCatalog::getAllocCount(u32 index_id) const {
 
 int IndexCatalog::getFileFd(u32 index_id) const {
     std::shared_lock<std::shared_mutex> lock(mutex);
-    
+
     auto it = entries.find(index_id);
     if (it != entries.end()) {
         return it->second.file_fd;
@@ -141,83 +132,83 @@ int IndexCatalog::getFileFd(u32 index_id) const {
 
 void IndexCatalog::persist() {
     std::shared_lock<std::shared_mutex> lock(mutex);
-    
+
     // Check if catalog file path is set
     if (catalog_file_path.empty()) {
         return;  // Nothing to persist
     }
-    
+
     // Check if the parent directory still exists (may have been deleted during cleanup)
     std::string parent_dir = catalog_file_path.substr(0, catalog_file_path.find_last_of('/'));
     struct stat st;
     if (!parent_dir.empty() && stat(parent_dir.c_str(), &st) != 0) {
         // Directory no longer exists, skip persistence silently
-        CALIBY_LOG_DEBUG("IndexCatalog", "Skipping persist - directory no longer exists: ", 
+        CALIBY_LOG_DEBUG("IndexCatalog", "Skipping persist - directory no longer exists: ",
                          parent_dir);
         return;
     }
-    
+
     std::ofstream ofs(catalog_file_path, std::ios::binary | std::ios::trunc);
     if (!ofs) {
-        CALIBY_LOG_ERROR("IndexCatalog", "Failed to open catalog file for writing: ", 
+        CALIBY_LOG_ERROR("IndexCatalog", "Failed to open catalog file for writing: ",
                          catalog_file_path);
         return;
     }
-    
+
     // Write number of entries
     u32 num_entries = entries.size();
     ofs.write(reinterpret_cast<const char*>(&num_entries), sizeof(num_entries));
-    
+
     // Write each entry
     for (const auto& pair : entries) {
         const IndexEntry& entry = pair.second;
         u64 alloc_count_value = entry.alloc_count.load(std::memory_order_acquire);
-        
+
         ofs.write(reinterpret_cast<const char*>(&entry.index_id), sizeof(entry.index_id));
         ofs.write(reinterpret_cast<const char*>(&alloc_count_value), sizeof(alloc_count_value));
         ofs.write(reinterpret_cast<const char*>(&entry.max_pages), sizeof(entry.max_pages));
         ofs.write(reinterpret_cast<const char*>(&entry.file_fd), sizeof(entry.file_fd));
     }
-    
+
     ofs.close();
-    CALIBY_LOG_DEBUG("IndexCatalog", "Persisted ", num_entries, " entries to ", 
+    CALIBY_LOG_DEBUG("IndexCatalog", "Persisted ", num_entries, " entries to ",
                      catalog_file_path);
 }
 
 void IndexCatalog::load() {
     std::unique_lock<std::shared_mutex> lock(mutex);
-    
+
     std::ifstream ifs(catalog_file_path, std::ios::binary);
     if (!ifs) {
-        CALIBY_LOG_INFO("IndexCatalog", "Catalog file not found, starting fresh: ", 
+        CALIBY_LOG_INFO("IndexCatalog", "Catalog file not found, starting fresh: ",
                         catalog_file_path);
         return;
     }
-    
+
     // Read number of entries
     u32 num_entries = 0;
     ifs.read(reinterpret_cast<char*>(&num_entries), sizeof(num_entries));
-    
+
     // Read each entry
     for (u32 i = 0; i < num_entries; i++) {
         IndexEntry entry;
         u64 alloc_count_value;
-        
+
         ifs.read(reinterpret_cast<char*>(&entry.index_id), sizeof(entry.index_id));
         ifs.read(reinterpret_cast<char*>(&alloc_count_value), sizeof(alloc_count_value));
         ifs.read(reinterpret_cast<char*>(&entry.max_pages), sizeof(entry.max_pages));
         ifs.read(reinterpret_cast<char*>(&entry.file_fd), sizeof(entry.file_fd));
-        
+
         // Reset file_fd since file descriptors are not portable across processes
         // The fd will be re-acquired when the index is actually used
         entry.file_fd = -1;
-        
+
         entry.alloc_count.store(alloc_count_value, std::memory_order_release);
         entries[entry.index_id] = std::move(entry);
     }
-    
+
     ifs.close();
-    CALIBY_LOG_DEBUG("IndexCatalog", "Loaded ", num_entries, " entries from ", 
+    CALIBY_LOG_DEBUG("IndexCatalog", "Loaded ", num_entries, " entries from ",
                      catalog_file_path);
 }
 
@@ -232,28 +223,29 @@ void IndexCatalog::clear() {
 //=============================================================================
 
 IndexTranslationArray::IndexTranslationArray(u32 indexId, u64 maxPages, u64 initialAllocCount, int fd)
-    : capacity(maxPages), file_fd(fd), index_id(indexId), 
+    : capacity(maxPages), file_fd(fd), index_id(indexId),
       allocCount(indexId == 0 ? initialAllocCount : (initialAllocCount == 0 ? 1 : initialAllocCount)) {
-    
+
     // Ensure minimum initial capacity
     u64 initialCapacity = std::max(maxPages, MIN_INITIAL_CAPACITY);
     capacity.store(initialCapacity, std::memory_order_relaxed);
-    
+
     // Allocate page state array using mmap (NOT huge pages for fine-grained hole punching)
     size_t arraySize = initialCapacity * sizeof(PageState);
-    pageStates = (PageState*)mmap(nullptr, arraySize, 
+    pageStates = (PageState*)mmap(nullptr, arraySize,
                                    PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (pageStates == MAP_FAILED) {
         throw std::runtime_error("IndexTranslationArray: Failed to mmap page state array");
     }
-    
+
     // Calculate number of OS page groups for ref counting
     numRefCountGroups = (arraySize + TRANSLATION_OS_PAGE_SIZE - 1) / TRANSLATION_OS_PAGE_SIZE;
-    
+
     // Allocate reference counts array
     refCounts = new std::atomic<u32>[numRefCountGroups]();
-    
+    // Allocate per-page write tracking frames (Phase 2 GSN plumbing)
+    frames = new BufferFrame[initialCapacity]();
     CALIBY_LOG_DEBUG("IndexTranslationArray", "Created for index ", indexId,
                      " with initial capacity=", initialCapacity, " pages (growable)",
                      " (", numRefCountGroups, " ref count groups)");
@@ -265,26 +257,26 @@ bool IndexTranslationArray::ensureCapacity(u64 minCapacity) {
     if (currentCapacity >= minCapacity) {
         return true;
     }
-    
+
     // Slow path: need to grow - acquire lock
     std::lock_guard<std::mutex> lock(growMutex);
-    
+
     // Double-check after acquiring lock (another thread may have grown)
     currentCapacity = capacity.load(std::memory_order_acquire);
     if (currentCapacity >= minCapacity) {
         return true;
     }
-    
+
     // Calculate new capacity (at least double, or enough for minCapacity)
     u64 newCapacity = currentCapacity;
     while (newCapacity < minCapacity) {
         newCapacity *= GROWTH_FACTOR;
     }
-    
+
     // Use mremap to grow the array in-place (Linux-specific, very efficient)
     size_t oldSize = currentCapacity * sizeof(PageState);
     size_t newSize = newCapacity * sizeof(PageState);
-    
+
     void* newPageStates = mremap(pageStates, oldSize, newSize, MREMAP_MAYMOVE);
     if (newPageStates == MAP_FAILED) {
         CALIBY_LOG_ERROR("IndexTranslationArray", "mremap failed for index ", index_id,
@@ -292,9 +284,9 @@ bool IndexTranslationArray::ensureCapacity(u64 minCapacity) {
                          " pages, errno: ", errno);
         return false;
     }
-    
+
     pageStates = (PageState*)newPageStates;
-    
+
     // Grow reference counts array
     u64 newNumRefCountGroups = (newSize + TRANSLATION_OS_PAGE_SIZE - 1) / TRANSLATION_OS_PAGE_SIZE;
     if (newNumRefCountGroups > numRefCountGroups) {
@@ -307,13 +299,21 @@ bool IndexTranslationArray::ensureCapacity(u64 minCapacity) {
         refCounts = newRefCounts;
         numRefCountGroups = newNumRefCountGroups;
     }
-    
+    // Grow per-page write tracking frames (Phase 2)
+    auto frames_new = new BufferFrame[newCapacity]();
+    for (u64 i = 0; i < currentCapacity; ++i) {
+        frames_new[i].lastWrittenGsn.store(
+            frames[i].lastWrittenGsn.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        frames_new[i].lastWriter = frames[i].lastWriter;
+    }
+    delete[] frames;
+    frames = frames_new;
     // Update capacity (atomic store with release semantics so other threads see new capacity)
     capacity.store(newCapacity, std::memory_order_release);
-    
+
     CALIBY_LOG_DEBUG("IndexTranslationArray", "Grew index ", index_id,
                      " from ", currentCapacity, " to ", newCapacity, " pages");
-    
+
     return true;
 }
 
@@ -332,13 +332,14 @@ IndexTranslationArray::~IndexTranslationArray() {
     //         std::cerr << "  Ref Count " << entry.first << ": " << entry.second << " groups" << std::endl;
     //     }
     // }
-    
+
+    if (frames != nullptr) delete[] frames;
     if (pageStates != nullptr && pageStates != MAP_FAILED) {
         size_t arraySize = capacity.load(std::memory_order_relaxed) * sizeof(PageState);
         munmap(pageStates, arraySize);
     }
     delete[] refCounts;
-    
+
     //std::cerr << "[IndexTranslationArray] Destroyed for index " << index_id << std::endl;
 }
 
@@ -348,18 +349,18 @@ void IndexTranslationArray::incrementRefCount(u64 localPageId) {
         // Atomically increment reference count with lock bit handling
         while (true) {
             u32 oldVal = refCounts[group].load(std::memory_order_acquire);
-            
+
             // Check if locked (highest bit set)
             if (oldVal & REF_COUNT_LOCK_BIT) {
                 _mm_pause();  // Spin-wait during hole-punching
                 continue;
             }
-            
+
             // Try to increment count (lower 31 bits)
             u32 count = oldVal & REF_COUNT_MASK;
             u32 newVal = (count + 1) & REF_COUNT_MASK;
-            
-            if (refCounts[group].compare_exchange_weak(oldVal, newVal, 
+
+            if (refCounts[group].compare_exchange_weak(oldVal, newVal,
                                                         std::memory_order_release,
                                                         std::memory_order_acquire)) {
                 break;  // Successfully incremented
@@ -374,13 +375,13 @@ void IndexTranslationArray::decrementRefCount(u64 localPageId, std::atomic<u64>&
     // Atomically decrement reference count with lock bit handling
     while (true) {
         u32 oldVal = refCounts[group].load(std::memory_order_acquire);
-        
+
         // Check if locked (highest bit set)
         if (oldVal & REF_COUNT_LOCK_BIT) {
             _mm_pause();
             continue;
         }
-        
+
         // Try to acquire lock first
         u32 lockedVal = oldVal | REF_COUNT_LOCK_BIT;
         if (refCounts[group].compare_exchange_weak(oldVal, lockedVal,
@@ -392,23 +393,23 @@ void IndexTranslationArray::decrementRefCount(u64 localPageId, std::atomic<u64>&
             if (count > 0) {
                 count--;
             }
-            
+
             if (count == 0) {
                 // Perform hole-punching via madvise on this index's translation array
                 void* osPageStart = reinterpret_cast<void*>(
-                    reinterpret_cast<uintptr_t>(pageStates) + 
+                    reinterpret_cast<uintptr_t>(pageStates) +
                     (group * TRANSLATION_OS_PAGE_SIZE)
                 );
-                
+
                 int result = madvise(osPageStart, TRANSLATION_OS_PAGE_SIZE, MADV_DONTNEED);
                 if (result == 0) {
                     holePunchCounter.fetch_add(1, std::memory_order_relaxed);
                     } else {
-                    CALIBY_LOG_WARN("IndexTranslationArray", "madvise MADV_DONTNEED failed for localPageId ", 
+                    CALIBY_LOG_WARN("IndexTranslationArray", "madvise MADV_DONTNEED failed for localPageId ",
                                     localPageId, " group ", group, " errno: ", errno);
                 }
             }
-            
+
             // Release lock and store new count
             refCounts[group].store(count, std::memory_order_release);
             return;
@@ -422,22 +423,22 @@ void IndexTranslationArray::decrementRefCount(u64 localPageId, std::atomic<u64>&
 
 TwoLevelPageStateArray::TwoLevelPageStateArray(u64 defaultIndexCapacity)
     : numIndexSlots(MAX_INDEXES), holePunchCounterPtr(nullptr), defaultArray(nullptr) {
-    
+
     // Allocate top-level array of atomic pointers
     size_t topArraySize = numIndexSlots * sizeof(std::atomic<IndexTranslationArray*>);
     indexArrays = new std::atomic<IndexTranslationArray*>[numIndexSlots]();
-    
+
     // Initialize all pointers to nullptr
     for (u32 i = 0; i < numIndexSlots; i++) {
         indexArrays[i].store(nullptr, std::memory_order_relaxed);
     }
-    
+
     // If default capacity specified, create index 0 for backward compatibility
     if (defaultIndexCapacity > 0) {
         defaultArray = new IndexTranslationArray(0, defaultIndexCapacity);
         indexArrays[0].store(defaultArray, std::memory_order_release);
     }
-    
+
     CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Created multi-index translation array",
                      " with ", numIndexSlots, " index slots",
                      (defaultIndexCapacity > 0 ? std::string(", default index capacity=") + std::to_string(defaultIndexCapacity) : ""));
@@ -452,33 +453,41 @@ TwoLevelPageStateArray::~TwoLevelPageStateArray() {
         }
     }
     delete[] indexArrays;
-    
+
     CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Destroyed multi-index translation array");
 }
 
+std::atomic<u64> TwoLevelPageStateArray::genClock{0};
 void TwoLevelPageStateArray::registerIndex(u32 indexId, u64 maxPages, u64 initialAllocCount, int fileFd) {
     if (indexId >= numIndexSlots) {
         throw std::out_of_range("TwoLevelPageStateArray::registerIndex: indexId out of range");
     }
 
     std::unique_lock<std::shared_mutex> lock(indexMutex);
+    generation.store(genClock.fetch_add(1) + 1, std::memory_order_relaxed);
 
-    // If already registered, just return — the index was already recovered or created
+    // If already registered: reuse it. Grow eagerly to maxPages when the
+    // first registration underestimated capacity, so the (racy) mremap
+    // growth happens once at index-creation time, never during concurrent
+    // add/fix traffic.
     IndexTranslationArray* existing = indexArrays[indexId].load(std::memory_order_acquire);
     if (existing != nullptr) {
+        if (existing->capacity.load(std::memory_order_relaxed) < maxPages) {
+            existing->ensureCapacity(maxPages);
+        }
         return;
     }
-    
+
     // Create new per-index translation array
     IndexTranslationArray* newArray = new IndexTranslationArray(indexId, maxPages, initialAllocCount, fileFd);
     indexArrays[indexId].store(newArray, std::memory_order_release);
-    
+
     // Update default array pointer if this is index 0
     if (indexId == 0) {
         defaultArray = newArray;
     }
-    
-    CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Registered index ", indexId, 
+
+    CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Registered index ", indexId,
                      " with capacity ", maxPages);
 }
 
@@ -486,34 +495,33 @@ void TwoLevelPageStateArray::unregisterIndex(u32 indexId) {
     if (indexId >= numIndexSlots) {
         throw std::out_of_range("TwoLevelPageStateArray::unregisterIndex: indexId out of range");
     }
-    
+
     std::unique_lock<std::shared_mutex> lock(indexMutex);
-    
+    generation.store(genClock.fetch_add(1) + 1, std::memory_order_relaxed);
+
     IndexTranslationArray* arr = indexArrays[indexId].load(std::memory_order_acquire);
     if (arr == nullptr) {
         throw std::runtime_error("TwoLevelPageStateArray::unregisterIndex: index not registered");
     }
-    
+
     // Clear the pointer first
     indexArrays[indexId].store(nullptr, std::memory_order_release);
-    
+
     // Update default array if needed
     if (indexId == 0) {
         defaultArray = nullptr;
     }
-    
+
     // Delete the array
     delete arr;
-    
-    // Increment generation to invalidate all thread-local caches
-    generation.fetch_add(1, std::memory_order_release);
-    
+
     CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Unregistered index ", indexId);
 }
 
 void TwoLevelPageStateArray::unregisterAllNonZero() {
     std::unique_lock<std::shared_mutex> lock(indexMutex);
-    
+    generation.store(genClock.fetch_add(1) + 1, std::memory_order_relaxed);
+
     int unregisteredCount = 0;
     for (u32 i = 1; i < numIndexSlots; ++i) {
         IndexTranslationArray* arr = indexArrays[i].load(std::memory_order_acquire);
@@ -523,12 +531,9 @@ void TwoLevelPageStateArray::unregisterAllNonZero() {
             unregisteredCount++;
         }
     }
-    
+
     if (unregisteredCount > 0) {
-        // Increment generation to invalidate all thread-local caches
-        generation.fetch_add(1, std::memory_order_release);
-        
-        CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Unregistered ", unregisteredCount, 
+        CALIBY_LOG_DEBUG("TwoLevelPageStateArray", "Unregistered ", unregisteredCount,
                          " non-zero indexes");
     }
 }
@@ -551,9 +556,9 @@ IndexTranslationArray* TwoLevelPageStateArray::getIndexArray(u32 indexId) const 
 void TwoLevelPageStateArray::incrementRefCount(PID pid) {
     u32 indexId = getIndexId(pid);
     u32 localPageId = getLocalPageId(pid);
-    
-    IndexTranslationArray* arr = (indexId == 0 && defaultArray) 
-                                  ? defaultArray 
+
+    IndexTranslationArray* arr = (indexId == 0 && defaultArray)
+                                  ? defaultArray
                                   : indexArrays[indexId].load(std::memory_order_acquire);
     if (arr) {
         arr->incrementRefCount(localPageId);
@@ -563,7 +568,7 @@ void TwoLevelPageStateArray::incrementRefCount(PID pid) {
 void TwoLevelPageStateArray::decrementRefCount(PID pid) {
     u32 indexId = getIndexId(pid);
     u32 localPageId = getLocalPageId(pid);
-    
+
     IndexTranslationArray* arr = (indexId == 0 && defaultArray)
                                   ? defaultArray
                                   : indexArrays[indexId].load(std::memory_order_acquire);
@@ -588,7 +593,7 @@ u64 TwoLevelPageStateArray::getIndexCapacity(u32 indexId) const {
 std::vector<std::pair<u32, u64>> TwoLevelPageStateArray::getAllIndexCapacities() const {
     std::vector<std::pair<u32, u64>> result;
     std::shared_lock<std::shared_mutex> lock(indexMutex);
-    
+
     for (u32 i = 0; i < numIndexSlots; ++i) {
         IndexTranslationArray* arr = indexArrays[i].load(std::memory_order_acquire);
         if (arr != nullptr) {
@@ -600,39 +605,39 @@ std::vector<std::pair<u32, u64>> TwoLevelPageStateArray::getAllIndexCapacities()
 }
 
 // ThreeLevelPageStateArray implementation
-ThreeLevelPageStateArray::ThreeLevelPageStateArray(u64 virtCount) 
+ThreeLevelPageStateArray::ThreeLevelPageStateArray(u64 virtCount)
     : total_entries(virtCount) {
-    
+
     // Calculate minimal bits needed for total entries
     u32 totalBits = bitsNeeded(virtCount);
-    
+
     // Top bits = total - middle - bottom bits
     u32 usedBits = bottomBits + middleBits;
     topBits = (totalBits > usedBits) ? (totalBits - usedBits) : 0;
     num_top_slots = 1U << topBits;
     num_middle_slots = 1U << middleBits;
     entries_per_slot = 1U << bottomBits;
-    
-    CALIBY_LOG_DEBUG("ThreeLevelPageStateArray", "virtCount=", virtCount, 
+
+    CALIBY_LOG_DEBUG("ThreeLevelPageStateArray", "virtCount=", virtCount,
                      " totalBits=", totalBits,
                      " topBits=", topBits, " (", num_top_slots, " slots)",
                      " middleBits=", middleBits, " (", num_middle_slots, " slots)",
                      " bottomBits=", bottomBits, " (", entries_per_slot, " entries/slot)");
-    
+
     // Allocate top-level array
     size_t top_size = num_top_slots * sizeof(PageState**);
     top_level_arrays = (PageState***)allocHuge(top_size);
-    
+
     // Allocate each middle-level array
     size_t middle_size = num_middle_slots * sizeof(PageState*);
     for (u32 i = 0; i < num_top_slots; i++) {
         top_level_arrays[i] = (PageState**)allocHuge(middle_size);
-        
+
         // Allocate each bottom-level array
         size_t bottom_level_size = entries_per_slot * sizeof(PageState);
         for (u32 j = 0; j < num_middle_slots; j++) {
             top_level_arrays[i][j] = (PageState*)allocHuge(bottom_level_size);
-            
+
             // Initialize all entries in this bottom-level array
             for (u32 k = 0; k < entries_per_slot; k++) {
                 top_level_arrays[i][j][k].init();
@@ -645,7 +650,7 @@ ThreeLevelPageStateArray::~ThreeLevelPageStateArray() {
     if (top_level_arrays) {
         size_t bottom_level_size = entries_per_slot * sizeof(PageState);
         size_t middle_size = num_middle_slots * sizeof(PageState*);
-        
+
         for (u32 i = 0; i < num_top_slots; i++) {
             if (top_level_arrays[i]) {
                 for (u32 j = 0; j < num_middle_slots; j++) {
@@ -669,7 +674,7 @@ void* allocHuge(size_t size) {
 }
 
 // use when lock is not free
-void yield(u64 counter) { 
+void yield(u64 counter) {
 
 }
 
@@ -722,7 +727,7 @@ bool ResidentPageSet::remove(u64 pid) {
     }
 }
 
-LibaioInterface::LibaioInterface(int blockfd, BufferManager* bm_ptr) : blockfd(blockfd), bm_ptr(bm_ptr) {
+LibaioInterface::LibaioInterface(BufferManager* p) : bm_ptr(p) {
     memset(&ctx, 0, sizeof(io_context_t));
     int ret = io_setup(maxIOs, &ctx);
     if (ret != 0) {
@@ -741,36 +746,36 @@ LibaioInterface::LibaioInterface(int blockfd, BufferManager* bm_ptr) : blockfd(b
 
 void LibaioInterface::writePages(const vector<PID>& pages) {
     assert(pages.size() <= maxIOs);
-    
+
     // Filter out pages with invalid file descriptors
     vector<PID> validPages;
     vector<u64> validIndices;
     validPages.reserve(pages.size());
     validIndices.reserve(pages.size());
-    
+
     for (u64 i = 0; i < pages.size(); i++) {
         PID pid = pages[i];
-        Page* page = bm_ptr->preparePageForWrite(pid);
-        
+        Page* page = ::bm_ptr->residentPtr(pid);
+
         // Get the correct file descriptor and local page ID for this PID
         PID localPageId;
-        int fd = bm_ptr->getFileDescriptorForPID(pid, localPageId);
-        
+        int fd = ::bm_ptr->getFileDescriptorForPID(pid, localPageId);
+
         // Skip pages with invalid file descriptors (may happen during shutdown)
         if (fd < 0) {
             continue;
         }
-        
+
         cbPtr[validPages.size()] = &cb[validPages.size()];
         io_prep_pwrite(cb + validPages.size(), fd, page, pageSize, pageSize * localPageId);
         validPages.push_back(pid);
         validIndices.push_back(i);
     }
-    
+
     if (validPages.empty()) {
         return;  // Nothing to write
     }
-    
+
     // Submit IOs, handling partial submissions
     size_t submitted = 0;
     while (submitted < validPages.size()) {
@@ -786,13 +791,14 @@ void LibaioInterface::writePages(const vector<PID>& pages) {
         }
         submitted += cnt;
     }
-    
+
     int cnt = io_getevents(ctx, validPages.size(), validPages.size(), events, nullptr);
     if (cnt != (int)validPages.size()) {
         CALIBY_LOG_ERROR("LibaioInterface", "io_getevents failed: ", cnt, " expected: ", validPages.size(), " errno: ", -cnt);
         exit(EXIT_FAILURE);
     }
 }
+
 
 void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& destinations) {
     assert(pages.size() == destinations.size());
@@ -802,11 +808,10 @@ void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& d
         PID pid = pages[i];
         Page* dest = destinations[i];
         cbPtr[i] = &cb[i];
-        
+
         // Get the correct file descriptor and local page ID for this PID
         PID localPageId;
-        int fd = bm_ptr->getFileDescriptorForPID(pid, localPageId);
-        
+        int fd = ::bm_ptr->getFileDescriptorForPID(pid, localPageId);
         io_prep_pread(cb + i, fd, dest, pageSize, pageSize * localPageId);
     }
 
@@ -824,15 +829,19 @@ void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& d
     // Check results and handle short reads (new file / beyond EOF)
     for (u64 i = 0; i < pages.size(); i++) {
         long res = events[i].res;
+        if (res < 0) {
+            CALIBY_LOG_ERROR("LibaioInterface", "read failed pid ", pages[i], " res ", res, " errno: ", -res);
+            exit(EXIT_FAILURE);
+        }
         if (res < static_cast<long>(pageSize)) {
             // Page doesn't exist in file yet (new file or beyond EOF)
             // Initialize as an empty/zeroed page
             memset(destinations[i], 0, pageSize);
-            destinations[i]->dirty = true;  // Mark dirty so it gets written
+            destinations[i]->p_gsn = BufferManager::advancePageGSN();
         } else {
-            destinations[i]->dirty = false;
+            ::bm_ptr->updateLastWrittenGsn(pages[i], destinations[i]->p_gsn);
         }
-        bm_ptr->readCount++;
+        ::bm_ptr->readCount++;
     }
 }
 
@@ -860,24 +869,10 @@ BufferManager::BufferManager(unsigned nthreads)
       pageState2Level(nullptr) {
     numThreads = nthreads;
     assert(virtSize >= physSize);
-    
-    // blockfd is now optional - will be -1 unless BLOCK env is explicitly set
-    // Each index uses its own file in the data directory
-    blockfd = -1;
-    const char* block_path = getenv("BLOCK");
-    if (block_path) {
-        blockfd = open(block_path, O_RDWR | O_DIRECT | O_CREAT, S_IRUSR | S_IWUSR);
-        if (blockfd == -1) {
-            CALIBY_LOG_WARN("BufferManager", "cannot open BLOCK device '", block_path, "', using per-index files only");
-        }
-    }
 
-    useTraditional = envOr("TRADITIONAL", 1);
-    useExmap = (!useTraditional) && envOr("EXMAP", 0);
-    u64 tradHashSetting = useTraditional ? envOr("TRADHASH", 5) : 5;  // Default to Array2Level (multi-index mode)
-    if (!useTraditional)
-        hashMode = HashMode::Array2Level;  // Use multi-index mode by default
-    else if (tradHashSetting == 1)
+    useTraditional = true;  // mmap/virtMem hash modes and exmap are deprecated
+    u64 tradHashSetting = envOr("TRADHASH", 5);  // Default to Array2Level (multi-index mode)
+    if (tradHashSetting == 1)
         hashMode = HashMode::Unordered;
     else if (tradHashSetting == 2)
         hashMode = HashMode::OpenAddress;
@@ -890,7 +885,7 @@ BufferManager::BufferManager(unsigned nthreads)
     else if (tradHashSetting == 6)
         hashMode = HashMode::Array3Level;
     else
-        hashMode = HashMode::Array1Access; 
+        hashMode = HashMode::Array1Access;
     PageState::setPackedMode(hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level);
     virtMem = nullptr;
     frameMem = nullptr;
@@ -899,7 +894,7 @@ BufferManager::BufferManager(unsigned nthreads)
 
     u64 virtAllocSize = virtSize + (1 << 16);  // guard space for optimistic reads
 
-    if (useTraditional) {
+    {
         frameMem = static_cast<Page*>(allocHuge(physCount * sizeof(Page)));
         if (frameMem == MAP_FAILED) {
             std::string msg = "Failed to allocate buffer pool memory (";
@@ -974,48 +969,9 @@ BufferManager::BufferManager(unsigned nthreads)
             } else {
                 die("invalid config for hashmap");
             }
-            // 
+            //
             pidToFrameHash->reserve(physCount * 1.5);
             frameToPidHash->reserve(physCount);
-        }
-        // round robin cursors will skip empty partitions automatically
-    } else {
-        if (useExmap) {
-            exmapfd = open("/dev/exmap", O_RDWR);
-            if (exmapfd < 0) die("open exmap");
-
-            struct exmap_ioctl_setup buffer;
-            buffer.fd = blockfd;
-            buffer.max_interfaces = maxWorkerThreads;
-            buffer.buffer_size = physCount;
-            buffer.flags = 0;
-            if (ioctl(exmapfd, EXMAP_IOCTL_SETUP, &buffer) < 0) die("ioctl: exmap_setup");
-
-            for (unsigned i = 0; i < maxWorkerThreads; i++) {
-                exmapInterface[i] = (struct exmap_user_interface*)mmap(NULL, pageSize, PROT_READ | PROT_WRITE,
-                                                                       MAP_SHARED, exmapfd, EXMAP_OFF_INTERFACE(i));
-                if (exmapInterface[i] == MAP_FAILED) die("setup exmapInterface");
-            }
-
-            virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_SHARED, exmapfd, 0);
-        } else {
-            virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (disableHugePageForFrameMem) {
-                madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
-            } else {
-                madvise(virtMem, virtAllocSize, MADV_HUGEPAGE);
-            }
-        }
-        if (virtMem == MAP_FAILED) {
-            std::string msg = "Failed to allocate virtual buffer memory (";
-            msg += std::to_string(virtAllocSize / (1024*1024));
-            msg += " MB). Try calling caliby.set_buffer_config(size_gb=X, virtgb=Y) with smaller values before caliby.open(). ";
-            msg += "(mmap errno: ";
-            msg += std::to_string(errno);
-            msg += " - ";
-            msg += strerror(errno);
-            msg += ")";
-            throw std::runtime_error(msg);
         }
     }
 
@@ -1055,14 +1011,14 @@ BufferManager::BufferManager(unsigned nthreads)
     // Must align with the actual allocation: 4KB if huge pages disabled, 2MB otherwise
     // Set NOHUGEPAGE_TRANSLATION_ARRAY=1 to disable huge pages and enable fine-grained hole-punching
     translationOSPageSize = (disableHugePageForTranslationArray && useTraditional) ? 4096 : (2 * 1024 * 1024);
-    
+
     // Initialize reference counting for hole-punching (Array1Access mode only)
     translationRefCounts = nullptr;
     if (hashMode == HashMode::Array1Access && useTraditional) {
         // Each OS page holds translationOSPageSize/sizeof(PageState) translation entries
         u64 entriesPerOSPage = translationOSPageSize / sizeof(PageState);
         numRefCountGroups = (virtCount + entriesPerOSPage - 1) / entriesPerOSPage;
-        
+
         // Lazily allocate reference counts using mmap with MAP_PRIVATE | MAP_ANONYMOUS
         // This ensures physical memory is only allocated on first write (zero-page COW)
         size_t refCountSize = numRefCountGroups * sizeof(std::atomic<u32>);
@@ -1082,10 +1038,10 @@ BufferManager::BufferManager(unsigned nthreads)
     writeCount = 0;
     holePunchCount = 0;
     batch = envOr("BATCH", 64);
-    
+
     // Initialize Index Catalog - path will be set when caliby.open() is called
     indexCatalog = std::make_unique<IndexCatalog>();
-    
+
     // Pre-allocate PID 0 as global metadata page for index recovery
     // This ensures GuardX<MetaDataPage>(0) can access it without hanging
     Page* metaPage = allocPage(nullptr);
@@ -1100,10 +1056,10 @@ BufferManager::BufferManager(unsigned nthreads)
     translation_specialization = "hash";
     #else
     #endif
-    CALIBY_LOG_INFO("BufferManager", "Initialized: virtgb:", virtSize / gb, 
-                    " physgb:", (float)physSize / gb, " traditional:", useTraditional, 
+    CALIBY_LOG_INFO("BufferManager", "Initialized: virtgb:", virtSize / gb,
+                    " physgb:", (float)physSize / gb, " traditional:", useTraditional,
                     " mmap_os_pagecache:", useMmapOSPageacche, " trad_hash:", static_cast<int>(hashMode),
-                    " exmap:", useExmap, " hugepage:", (disableHugePageForFrameMem == 0),
+                    " hugepage:", (disableHugePageForFrameMem == 0),
                     " hugepage_translation:", (disableHugePageForTranslationArray == 0),
                     " num_threads:", numThreads, " specialization:", translation_specialization);
 }
@@ -1116,7 +1072,7 @@ BufferManager::~BufferManager() {
     } catch (...) {
         CALIBY_LOG_ERROR("BufferManager", "~BufferManager encountered an unknown error during flush.");
     }
-    
+
     // Cleanup lazily allocated reference counts
     if (translationRefCounts != nullptr) {
         // print ref count stats using a histogram style
@@ -1147,7 +1103,7 @@ BufferManager::~BufferManager() {
 
     // print hole punch count
     CALIBY_LOG_DEBUG("BufferManager", "Total hole punches (madvise count): ", holePunchCount);
-    
+
     // Persist catalog before shutdown
     if (indexCatalog) {
         indexCatalog->persist();
@@ -1160,10 +1116,10 @@ IOInterface& BufferManager::getIOInterface() {
     //     thread_local IOUringInterface instance(blockfd, this);
     //     return instance;
     // } else {
-    //     thread_local LibaioInterface instance(blockfd, this);
+    //     thread_local LibaioInterface instance(this);
     //     return instance;
     // }
-    thread_local LibaioInterface instance(blockfd, this);
+    thread_local LibaioInterface instance(this);
     return instance;
 }
 
@@ -1173,7 +1129,7 @@ PIDAllocator* BufferManager::getOrCreateAllocatorForIndex(u32 index_id, u64 max_
     if (index_id == 0) {
         return nullptr;
     }
-    
+
     // First check if allocator exists
     {
         std::shared_lock<std::shared_mutex> lock(catalogMutex);
@@ -1182,49 +1138,95 @@ PIDAllocator* BufferManager::getOrCreateAllocatorForIndex(u32 index_id, u64 max_
             return it->second.get();
         }
     }
-    
+
     // Create new allocator
     std::unique_lock<std::shared_mutex> lock(catalogMutex);
-    
+
     // Double-check after acquiring write lock
     auto it = perIndexAllocators.find(index_id);
     if (it != perIndexAllocators.end()) {
         return it->second.get();
     }
-    
+
     // Register index in catalog if not already registered
     if (!indexCatalog) {
         throw std::runtime_error("IndexCatalog not initialized");
     }
-    
+
     indexCatalog->registerIndex(index_id, max_pages);
-    
+
     // Initialize from catalog
     u64 saved_alloc_count = indexCatalog->getAllocCount(index_id);
-    
-    // Get file descriptor from catalog (or fall back to global blockfd)
+
+    // Get file descriptor from catalog (index 0 is wired via setGlobalNamespaceFd)
     int index_fd = indexCatalog->getFileFd(index_id);
-    if (index_fd < 0) {
-        index_fd = blockfd;  // Fall back to global heapfile if no per-index file
-    }
-    
+    assert(index_fd >= 0);
+
     // Register index in the translation array (Array2Level mode)
     if (hashMode == HashMode::Array2Level && pageState2Level) {
         if (!pageState2Level->isIndexRegistered(index_id)) {
             pageState2Level->registerIndex(index_id, max_pages, saved_alloc_count, index_fd);
         }
     }
-    
+
     // Create new allocator
     auto allocator = std::make_unique<PIDAllocator>(index_id);
-    
+
     allocator->next.store(saved_alloc_count, std::memory_order_release);
     allocator->end.store(saved_alloc_count, std::memory_order_release);
-    
+
     PIDAllocator* ptr = allocator.get();
     perIndexAllocators[index_id] = std::move(allocator);
-    
+
     return ptr;
+}
+
+void BufferManager::setGlobalNamespaceFd(int fd) {
+    // Backing file for index-0 PIDs (global MetaDataPage + engine BTree pages);
+    // wired into index 0's translation array instead of a separate fd field.
+    if (hashMode == HashMode::Array2Level && pageState2Level && pageState2Level->defaultArray) {
+        pageState2Level->defaultArray->file_fd = fd;
+    }
+}
+
+bool BufferManager::evictable(PID pid) {
+    // # ponytail: metadata/BTree (index-0) pages stay resident — pre-existing
+    // Array2Level eviction of them hangs under force evicts; revisit when the
+    // eviction path is hardened. They are still flushable (durability intact).
+    PID localPageId;
+    if (getFileDescriptorForPID(pid, localPageId) < 0) return false;
+    if (hashMode == HashMode::Array2Level && pageState2Level &&
+        pageState2Level->getIndexId(pid) == 0)
+        return false;
+    return true;
+}
+
+void BufferManager::ensureCapacityForPid(PID pid, u64 localPageId) {
+    if (!pageState2Level) return;
+    u32 indexId = static_cast<u32>(pid >> TwoLevelPageStateArray::LOCAL_PAGE_BITS);
+    if (IndexTranslationArray* arr = pageState2Level->getIndexArray(indexId)) {
+        arr->ensureCapacity(localPageId + 1);
+    }
+}
+
+void BufferManager::reloadGlobalMetadataPage() {
+    // The ctor pre-allocates PID 0 zeroed; recover the real MetaDataPage from
+    // disk now that the index-0 backing file is known.
+    PID pid = metadataPageId;
+    PID localPageId;
+    int fd = getFileDescriptorForPID(pid, localPageId);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(pageSize)) return;
+    GuardX<MetaDataPage> guard(pid);
+    if (pread(fd, guard.ptr, pageSize, 0) == static_cast<int>(pageSize)) {
+        u64 stored = guard->getAllocCountSnapshot();
+        u64 current = allocCount.load(std::memory_order_relaxed);
+        if (stored > current) {
+            allocCount.store(stored, std::memory_order_relaxed);
+            CALIBY_LOG_INFO("BufferManager", "Restored allocCount from on-disk metadata: ", stored);
+        }
+    }
 }
 
 int BufferManager::getFileDescriptorForPID(PID pid, PID& localPageId) {
@@ -1232,16 +1234,16 @@ int BufferManager::getFileDescriptorForPID(PID pid, PID& localPageId) {
     if (hashMode == HashMode::Array2Level && pageState2Level) {
         u32 indexId = pageState2Level->getIndexId(pid);
         localPageId = pageState2Level->getLocalPageId(pid);
-        
+
         IndexTranslationArray* arr = pageState2Level->getIndexArray(indexId);
         if (arr && arr->file_fd >= 0) {
             return arr->file_fd;
         }
     }
-    
-    // Fall back to global blockfd for single-index mode or if fd not set
+
+    // Single-index mode: no per-index fd registered; caller handles fd < 0.
     localPageId = pid;
-    return blockfd;
+    return -1;
 }
 
 bool BufferManager::isValidPtr(void* page) {
@@ -1378,12 +1380,65 @@ Page* BufferManager::residentPtr(PID pid, u64 stateAndVersion) {
     // return frameMem + static_cast<size_t>(frame);
 }
 
-Page* BufferManager::toPtr(PID pid) { return residentPtr(pid); }
+// ---- GSN / dirty-tracking plumbing implementations (Phase 2) ----------------
+std::atomic<u64> BufferManager::pageGsnClock{0};
+u64 BufferManager::flushedGsnLimit() {
+#ifdef CALIBY_ENABLE_WAL
+    if (caliby::recovery::LogManager::HasInstance()) {
+        return static_cast<u64>(
+            caliby::recovery::LogManager::global_min_gsn_flushed.load(std::memory_order_acquire));
+    }
+#endif
+    return std::numeric_limits<u64>::max();
+}
 
-Page* BufferManager::preparePageForWrite(PID pid) {
+bool BufferManager::pageIsDirty(PID pid) {
     Page* page = residentPtr(pid);
-    page->dirty = false;
-    return page;
+    if (page == nullptr) return false;
+    return page->p_gsn > lastWrittenGsnOf(pid);
+}
+
+
+u64 BufferManager::lastWrittenGsnOf(PID pid) {
+    if (hashMode == HashMode::Array2Level && pageState2Level) {
+        IndexTranslationArray* arr = pageState2Level->getIndexArray(getIndexIdFromPID(pid));
+        if (!arr) arr = pageState2Level->defaultArray;
+        if (arr) {
+            return arr->lastWrittenGsnOf(getLocalPageIdFromPID(pid));
+        }
+    }
+    return 0;
+}
+
+void BufferManager::updateLastWrittenGsn(PID pid, u64 gsn) {
+    if (hashMode == HashMode::Array2Level && pageState2Level) {
+        IndexTranslationArray* arr = pageState2Level->getIndexArray(getIndexIdFromPID(pid));
+        if (!arr) arr = pageState2Level->defaultArray;
+        if (arr) {
+            arr->setLastWrittenGsn(getLocalPageIdFromPID(pid), gsn);
+        }
+    }
+}
+
+void BufferManager::setLastWriter(PID pid, uint16_t w_id) {
+    if (hashMode == HashMode::Array2Level && pageState2Level) {
+        IndexTranslationArray* arr = pageState2Level->getIndexArray(getIndexIdFromPID(pid));
+        if (!arr) arr = pageState2Level->defaultArray;
+        if (arr) {
+            arr->setLastWriter(getLocalPageIdFromPID(pid), w_id);
+        }
+    }
+}
+
+uint16_t BufferManager::lastWriterOf(PID pid) {
+    if (hashMode == HashMode::Array2Level && pageState2Level) {
+        IndexTranslationArray* arr = pageState2Level->getIndexArray(getIndexIdFromPID(pid));
+        if (!arr) arr = pageState2Level->defaultArray;
+        if (arr) {
+            return arr->frames[getLocalPageIdFromPID(pid)].lastWriter;
+        }
+    }
+    return 0;
 }
 
 static thread_local u32 freePartitionCursor = []() -> u32 {
@@ -1412,10 +1467,10 @@ u32 BufferManager::popFreeFrame() {
 Page* BufferManager::acquireFrameForPid(PID pid) {
     // static std::atomic<int> callCount{0};
     // if (callCount.fetch_add(1) < 10) {
-    //     std::cerr << "[acquireFrameForPid] Called for pid=" << pid << " useTraditional=" << useTraditional 
+    //     std::cerr << "[acquireFrameForPid] Called for pid=" << pid << " useTraditional=" << useTraditional
     //               << " hashMode=" << (int)hashMode << std::endl;
     // }
-    
+
     // For non-traditional (mmap) mode, we need to handle multi-index PIDs specially
     // since the encoded PID cannot be used directly as a virtual memory offset
     // if (!useTraditional) {
@@ -1438,34 +1493,34 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
         pidToFrameArray[pid].store(static_cast<u64>(frame), std::memory_order_release);
         frameToPidArray[frame].store(pid, std::memory_order_release);
     } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
-        
+
         // Increment reference counter for this OS page group (Array1Access only)
         if (hashMode == HashMode::Array1Access && translationRefCounts) {
             u64 entriesPerOSPage = translationOSPageSize / sizeof(PageState);
             u64 refCountIdx = pid / entriesPerOSPage;
-            
+
             // Atomically increment reference count with lock bit handling
             while (true) {
                 u32 oldVal = translationRefCounts[refCountIdx].load(std::memory_order_acquire);
-                
+
                 // Check if locked (highest bit set)
                 if (oldVal & REF_COUNT_LOCK_BIT) {
                     _mm_pause();  // Spin-wait during hole-punching
                     continue;
                 }
-                
+
                 // Try to increment count (lower 31 bits)
                 u32 count = oldVal & REF_COUNT_MASK;
                 u32 newVal = (count + 1) & REF_COUNT_MASK;
-                
-                if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, newVal, 
+
+                if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, newVal,
                                                                             std::memory_order_release,
                                                                             std::memory_order_acquire)) {
                     break;  // Successfully incremented
                 }
             }
         }
-        
+
         // Increment reference counter for Array2Level mode (multi-index translation array)
         if (hashMode == HashMode::Array2Level && pageState2Level) {
             // static std::atomic<int> incCount{0};
@@ -1474,12 +1529,12 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
             // }
             pageState2Level->incrementRefCount(pid);
         }
-        
+
         //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
         getPageState(pid).setFrameValue(frame);
         frameToPidArray[frame].store(pid, std::memory_order_release);
         //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
-        
+
     } else {
         u64 frameId = static_cast<u64>(frame);
         pidToFrameHash->insertOrAssign(pid, frameId);
@@ -1490,12 +1545,12 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
 
 void BufferManager::releaseFrame(PID pid) {
     if (!useTraditional) return;
-    
+
     // static std::atomic<int> callCount{0};
     // if (callCount.fetch_add(1) < 10) {
     //     std::cerr << "[releaseFrame] Called for pid=" << pid << " hashMode=" << (int)hashMode << std::endl;
     // }
-    
+
     u64 frameId;
     if (hashMode == HashMode::Array) {
         //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
@@ -1509,33 +1564,33 @@ void BufferManager::releaseFrame(PID pid) {
         getPageState(pid).clearFrameValue();
         frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
         //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
-        
+
         // Reference counting and hole-punching for both Array1Access and Array2Level
-        if ((hashMode == HashMode::Array1Access && translationRefCounts) || 
+        if ((hashMode == HashMode::Array1Access && translationRefCounts) ||
             (hashMode == HashMode::Array2Level && pageState2Level)) {
-            
+
             // static std::atomic<int> entryCount{0};
             // if (entryCount.fetch_add(1) < 10) {
-            //     std::cerr << "[releaseFrame] Entered ref counting branch: hashMode=" << (int)hashMode 
+            //     std::cerr << "[releaseFrame] Entered ref counting branch: hashMode=" << (int)hashMode
             //               << " translationRefCounts=" << (void*)translationRefCounts
             //               << " pageState2Level=" << (void*)pageState2Level.get() << std::endl;
             // }
-            
+
             if (hashMode == HashMode::Array1Access && translationRefCounts) {
                 // Array1Access: single-level translation array with reference counting
                 u64 entriesPerOSPage = translationOSPageSize / sizeof(PageState);
                 u64 refCountIdx = pid / entriesPerOSPage;
-                
+
                 // Atomically decrement reference count with lock bit handling
                 while (true) {
                     u32 oldVal = translationRefCounts[refCountIdx].load(std::memory_order_acquire);
-                    
+
                     // Check if locked (highest bit set)
                     if (oldVal & REF_COUNT_LOCK_BIT) {
                         _mm_pause();
                         continue;
                     }
-                    
+
                     // Try to acquire lock first
                     u32 lockedVal = oldVal | REF_COUNT_LOCK_BIT;
                     if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, lockedVal,
@@ -1551,10 +1606,10 @@ void BufferManager::releaseFrame(PID pid) {
                         if (count == 0) {
                              // Perform hole-punching via madvise
                             void* osPageStart = reinterpret_cast<void*>(
-                                reinterpret_cast<uintptr_t>(pageState) + 
+                                reinterpret_cast<uintptr_t>(pageState) +
                                 (refCountIdx * entriesPerOSPage * sizeof(PageState))
                             );
-                            
+
                             int result = madvise(osPageStart, translationOSPageSize, MADV_DONTNEED);
                             if (result == 0) {
                                 holePunchCount.fetch_add(1, std::memory_order_relaxed);
@@ -1563,7 +1618,7 @@ void BufferManager::releaseFrame(PID pid) {
                                                 " errno: ", errno);
                             }
                         }
-                        
+
                         // Release lock and store new count
                         translationRefCounts[refCountIdx].store(count, std::memory_order_release);
                         break;
@@ -1573,7 +1628,7 @@ void BufferManager::releaseFrame(PID pid) {
                 // Array2Level: multi-index translation array with per-index reference counting
                 u32 indexId = pageState2Level->getIndexId(pid);
                 u32 localPageId = pageState2Level->getLocalPageId(pid);
-                
+
                 IndexTranslationArray* indexArray = pageState2Level->getIndexArray(indexId);
                 if (indexArray) {
                     u64 group = indexArray->getRefCountGroup(localPageId);
@@ -1581,13 +1636,13 @@ void BufferManager::releaseFrame(PID pid) {
                         // Atomically decrement reference count with lock bit handling
                         while (true) {
                             u32 oldVal = indexArray->refCounts[group].load(std::memory_order_acquire);
-                            
+
                             // Check if locked (highest bit set)
                             if (oldVal & REF_COUNT_LOCK_BIT) {
                                 _mm_pause();
                                 continue;
                             }
-                            
+
                             // Try to acquire lock first
                             u32 lockedVal = oldVal | REF_COUNT_LOCK_BIT;
                             if (indexArray->refCounts[group].compare_exchange_weak(oldVal, lockedVal,
@@ -1598,17 +1653,17 @@ void BufferManager::releaseFrame(PID pid) {
                                 if (count > 0) {
                                     count--;
                                 }
-                                
+
                                 // must obtain the counter lock first before unlocking
                                 getPageState(pid).unlockXEvicted();  // Unlock the page state and set it to 0
-                                
+
                                 if (count == 0) {
                                     // Perform hole-punching via madvise on this index's translation array
                                     void* osPageStart = reinterpret_cast<void*>(
-                                        reinterpret_cast<uintptr_t>(indexArray->pageStates) + 
+                                        reinterpret_cast<uintptr_t>(indexArray->pageStates) +
                                         (group * IndexTranslationArray::TRANSLATION_OS_PAGE_SIZE)
                                     );
-                                    
+
                                     int result = madvise(osPageStart, IndexTranslationArray::TRANSLATION_OS_PAGE_SIZE, MADV_DONTNEED);
                                     if (result == 0) {
                                         holePunchCount.fetch_add(1, std::memory_order_relaxed);
@@ -1618,7 +1673,7 @@ void BufferManager::releaseFrame(PID pid) {
                                                         " errno: ", errno);
                                     }
                                 }
-                                
+
                                 // Release lock and store new count
                                 indexArray->refCounts[group].store(count, std::memory_order_release);
                                 break;
@@ -1696,18 +1751,9 @@ Page* BufferManager::allocPage(PIDAllocator* allocator) {
     assert(succ);
     Page* page = acquireFrameForPid(pid);
 
-    if (useExmap) {
-        exmapInterface[workerThreadId]->iov[0].page = pid;
-        exmapInterface[workerThreadId]->iov[0].len = 1;
-        while (exmapAction(exmapfd, EXMAP_OP_ALLOC, 1) < 0) {
-            CALIBY_LOG_WARN("BufferManager", "allocPage errno: ", errno, " pid: ", pid, " workerId: ", workerThreadId);
-            ensureFreePages();
-        }
-    }
-
     // Store global PID for toPID lookup in mmap mode
     lastAllocatedGlobalPid = pid;
-    
+
     // Add to resident set for traditional mode (needed for eviction)
     if (useTraditional) {
         residentSet.insert(pid);
@@ -1723,20 +1769,20 @@ Page* BufferManager::allocPageForIndex(u32 indexId, PIDAllocator* allocator) {
     if (indexId == 0) {
         return allocPage(allocator);
     }
-    
+
     physUsedCount++;
     ensureFreePages();
-    
+
     u64 localPid;
-    
+
     // Get the per-index translation array
     IndexTranslationArray* indexArray = pageState2Level ? pageState2Level->getIndexArray(indexId) : nullptr;
-    
+
     if (!indexArray) {
         // Fallback to global allocCount for index 0 or unregistered indexes
         return allocPage(allocator);
     }
-    
+
     // Allocate from per-index counter
     if (allocator) {
         std::lock_guard<std::mutex> g(allocator->lock);
@@ -1755,7 +1801,7 @@ Page* BufferManager::allocPageForIndex(u32 indexId, PIDAllocator* allocator) {
     } else {
         localPid = indexArray->allocCount++;
     }
-    
+
     // Ensure capacity - grow array if needed (truly unbounded growth)
     if (localPid >= indexArray->capacity.load(std::memory_order_acquire)) {
         // Need more capacity - grow the array
@@ -1764,32 +1810,23 @@ Page* BufferManager::allocPageForIndex(u32 indexId, PIDAllocator* allocator) {
             exit(EXIT_FAILURE);  // Only fail if mremap fails (out of virtual address space)
         }
     }
-    
+
     // Encode as global PID: [index_id (32 bits)][local_page_id (32 bits)]
     u64 globalPid = (static_cast<u64>(indexId) << 32) | (localPid & 0xFFFFFFFFULL);
-    
+
     u64 stateAndVersion = getPageState(globalPid).stateAndVersion;
-    
+
     bool succ = getPageState(globalPid).tryLockX(stateAndVersion);
     assert(succ);
-    
+
     Page* page = acquireFrameForPid(globalPid);
-    
+
     // Store global PID for toPID lookup in mmap mode
     lastAllocatedGlobalPid = globalPid;
-    
+
     // Add to resident set for traditional mode (needed for eviction)
     if (useTraditional) {
         residentSet.insert(globalPid);
-    }
-
-    if (useExmap) {
-        exmapInterface[workerThreadId]->iov[0].page = globalPid;
-        exmapInterface[workerThreadId]->iov[0].len = 1;
-        while (exmapAction(exmapfd, EXMAP_OP_ALLOC, 1) < 0) {
-            CALIBY_LOG_WARN("BufferManager", "allocPageForIndex errno: ", errno, " pid: ", globalPid, " workerId: ", workerThreadId);
-            ensureFreePages();
-        }
     }
 
     // DON'T unlock - the AllocGuard will handle that in its destructor
@@ -1807,7 +1844,7 @@ void BufferManager::updateAllocCountSnapshot(u64 latest_alloc) {
             GuardX<MetaDataPage> meta_write(std::move(meta_guard));
             if (meta_write->getAllocCountSnapshot() < latest_alloc) {
                 meta_write->setAllocCountSnapshot(latest_alloc);
-                meta_write->dirty = true;
+                markPageDirty(meta_write);
             }
             return;
         } catch (const OLCRestartException&) {
@@ -1830,7 +1867,7 @@ Page* BufferManager::fixX(PID pid) {
     for (u64 repeatCounter = 0;; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion.load();
         u64 state = PageState::getState(stateAndVersion);
-        
+
     if (useMmapOSPageacche) {
             // In mmap+OS page cache mode, pages are never evicted by DB
             // Only need to handle: Locked, Marked, Unlocked states
@@ -1888,7 +1925,7 @@ Page* BufferManager::fixS(PID pid) {
     for (u64 repeatCounter = 0;; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion;
         u64 state = PageState::getState(stateAndVersion);
-        
+
         if (useMmapOSPageacche) {
             // In mmap+OS page cache mode, pages are never evicted by DB
             // Only need to handle: Locked, Marked, Unlocked, and shared states
@@ -1951,44 +1988,38 @@ Page* BufferManager::fixS(PID pid) {
 
 void BufferManager::unfixS(PID pid) { getPageState(pid).unlockS(); }
 
-void BufferManager::unfixX(PID pid) { 
+void BufferManager::unfixX(PID pid) {
     getPageState(pid).unlockX();
 }
 
 void BufferManager::readPage(PID pid, Page* dest) {
-    if (useExmap) {
-        for (u64 repeatCounter = 0;; repeatCounter++) {
-            int ret = pread(exmapfd, dest, pageSize, workerThreadId);
-            if (ret == pageSize) {
-                assert(ret == pageSize);
-                dest->dirty = false;
-                readCount++;
-                return;
-            }
-            CALIBY_LOG_WARN("BufferManager", "readPage errno: ", errno, " pid: ", pid, " workerId: ", workerThreadId);
-            ensureFreePages();
-        }
-    } else {
-        // Get the correct file descriptor and local page ID for this PID
-        PID localPageId;
-        int fd = getFileDescriptorForPID(pid, localPageId);
-        
-        int ret = pread(fd, dest, pageSize, localPageId * pageSize);
-        if (ret < static_cast<int>(pageSize)) {
-            // Page doesn't exist in file yet (new file or beyond EOF)
-            // Initialize as an empty/zeroed page
-            memset(dest, 0, pageSize);
-            dest->dirty = true;  // Mark dirty so it gets written
-        } else {
-            dest->dirty = false;
-        }
-        readCount++;
+    // Get the correct file descriptor and local page ID for this PID
+    PID localPageId;
+    int fd = getFileDescriptorForPID(pid, localPageId);
+    int ret = pread(fd, dest, pageSize, localPageId * pageSize);
+    if (ret < 0) {
+        // Hard error (EBADF/EIO/...): the page content lives nowhere we can
+        // reach. Zero-filling here would silently corrupt the page (real
+        // pages were silently zero-filled before), so fail loudly.
+        throw std::runtime_error("BufferManager::readPage failed for pid " + std::to_string(pid) +
+                                 " fd=" + std::to_string(fd) + " errno=" + std::to_string(errno));
     }
+    if (ret < static_cast<int>(pageSize)) {
+        // Page doesn't exist in file yet (new file or beyond EOF)
+        // Initialize as an empty/zeroed page
+        memset(dest, 0, pageSize);
+        dest->p_gsn = BufferManager::advancePageGSN();
+    } else {
+        updateLastWrittenGsn(pid, dest->p_gsn);
+    }
+    readCount++;
 }
 
 void BufferManager::flushAll() {
     std::vector<PID> batch;
     batch.reserve(LibaioInterface::maxIOs);
+    std::vector<u64> batchGsn;  // captured p_gsn per batch entry (Phase 2)
+    batchGsn.reserve(LibaioInterface::maxIOs);
     std::vector<PageState*> locked_states;
     locked_states.reserve(LibaioInterface::maxIOs);
     int flushed_pages = 0;
@@ -2003,14 +2034,20 @@ void BufferManager::flushAll() {
                 ps->unlockS();
             }
             batch.clear();
+            batchGsn.clear();
             locked_states.clear();
             throw;
         }
 
+        // Raise last_written_gsn for every page whose image is now on disk.
+        for (size_t i = 0; i < batch.size(); ++i) {
+            updateLastWrittenGsn(batch[i], batchGsn[i]);
+        }
         for (PageState* ps : locked_states) {
             ps->unlockS();
         }
         batch.clear();
+        batchGsn.clear();
         locked_states.clear();
     };
 
@@ -2038,8 +2075,16 @@ void BufferManager::flushAll() {
 #else
                 Page* page_ptr = residentPtr(pid, state_and_version);
 #endif
-                if (page_ptr->dirty) {
+                // Dirty is derived: p_gsn > last_written_gsn. WAL gate: only
+                // flush pages whose log records are already durable.
+                u64 page_gsn = page_ptr->p_gsn;
+                PID localPageId;
+                if (page_gsn <= lastWrittenGsnOf(pid) ||   // clean
+                    (getFileDescriptorForPID(pid, localPageId) < 0)) {  // no backing file: never flush
+                    ps.unlockS();
+                } else if (page_gsn <= flushedGsnLimit()) {  // WAL gate
                     batch.push_back(pid);
+                    batchGsn.push_back(page_gsn);
                     locked_states.push_back(&ps);
                 } else {
                     ps.unlockS();
@@ -2060,6 +2105,12 @@ void BufferManager::flushAll() {
             IndexTranslationArray* arr = pageState2Level->getIndexArray(indexId);
             if (arr) {
                 u64 indexAllocCount = arr->allocCount.load(std::memory_order_acquire);
+                // Index 0 covers global allocPage() allocations (metadata page
+                // etc.) which bump BufferManager::allocCount, not the array.
+                if (indexId == 0) {
+                    u64 global_alloc = allocCount.load(std::memory_order_acquire);
+                    if (global_alloc > indexAllocCount) indexAllocCount = global_alloc;
+                }
                 u64 indexCapacity = arr->capacity.load(std::memory_order_acquire);
                 // Use min of allocCount and capacity to avoid overflow
                 u64 maxPages = std::min(indexAllocCount, indexCapacity);
@@ -2085,24 +2136,24 @@ void BufferManager::flushAll() {
 void BufferManager::persistIndexCapacities() {
     // Save all index translation array capacities to the IndexCatalog
     // This ensures proper recovery of array sizes on restart
-    
+
     if (hashMode != HashMode::Array2Level || !pageState2Level) {
         return;
     }
-    
+
     auto& catalog = caliby::IndexCatalog::instance();
     if (!catalog.is_initialized()) {
         return;
     }
-    
+
     auto capacities = pageState2Level->getAllIndexCapacities();
     for (const auto& [indexId, capacity] : capacities) {
         // Skip index 0 (default array) if not explicitly created
         if (indexId == 0) continue;
-        
+
         catalog.update_index_alloc_pages(indexId, capacity);
     }
-    
+
     CALIBY_LOG_DEBUG("BufferManager", "Persisted capacities for ", capacities.size(), " indexes");
 }
 
@@ -2113,31 +2164,53 @@ void BufferManager::evict() {
     toWrite.reserve(batch);
 
     // 0. find candidates, lock dirty ones in shared mode
+    vector<PID> toWriteGsn;  // captured p_gsn per toWrite entry (Phase 2)
+    u64 gsnLimit = flushedGsnLimit();
     while (toEvict.size() + toWrite.size() < batch) {
         residentSet.iterateClockBatch(batch, [&](PID pid) {
+            // no backing file / global NS: keep resident
+            if (!evictable(pid)) { return; }
             PageState& ps = getPageState(pid);
             u64 v = ps.stateAndVersion;
             switch (PageState::getState(v)) {
-                case PageState::Marked:
-                    if (residentPtr(pid)->dirty) {
-                        if (ps.tryLockS(v)) toWrite.push_back(pid);
+                case PageState::Marked: {
+                    Page* page = residentPtr(pid);
+                    u64 page_gsn = page->p_gsn;
+                    if (page_gsn > lastWrittenGsnOf(pid)) {  // derived dirty
+                        if (page_gsn <= gsnLimit && ps.tryLockS(v)) {  // WAL gate
+                            toWrite.push_back(pid);
+                            toWriteGsn.push_back(page_gsn);
+                        }
+                        // gated or lock contention: cannot flush; page stays
                     } else {
                         toEvict.push_back(pid);
                     }
                     break;
-                case PageState::Unlocked:
+                }
+                case PageState::Unlocked: {
                     ps.tryMark(v);
                     break;
+                }
                 default:
                     break;  // skip
             };
         });
     }
 
+    evictCandidates(std::move(toEvict), std::move(toWrite), std::move(toWriteGsn));
+}
+
+// Shared tail of evict()/forceEvictPortion(): write dirty pages back,
+// revalidate + lock candidates, then release frames.
+void BufferManager::evictCandidates(vector<PID> toEvict, vector<PID> toWrite, vector<u64> toWriteGsn) {
     // 1. write dirty pages
     if (toWrite.size() > 0) {
         getIOInterface().writePages(toWrite);
         writeCount += toWrite.size();
+        for (size_t i = 0; i < toWrite.size(); ++i) {
+            updateLastWrittenGsn(toWrite[i], toWriteGsn[i]);
+        }
+        toWriteGsn.clear();
     }
 
     // 2. try to lock clean page candidates
@@ -2160,35 +2233,17 @@ void BufferManager::evict() {
             ps.unlockS();
     }
 
-    // 4. remove from page table
-    if (useExmap) {
-        for (u64 i = 0; i < toEvict.size(); i++) {
-            exmapInterface[workerThreadId]->iov[i].page = toEvict[i];
-            exmapInterface[workerThreadId]->iov[i].len = 1;
-        }
-        if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0) die("ioctl: EXMAP_OP_FREE");
-    } else if (!useTraditional) {
-        for (u64& pid : toEvict) madvise(virtMem + pid, pageSize, MADV_DONTNEED);
-    }
-
     // 5. remove from hash table and unlock
-    // static std::atomic<int> evictLoopCount{0};
-    // if (evictLoopCount.fetch_add(1) < 5) {
-    //     std::cerr << "[evict] toEvict.size()=" << toEvict.size() << " useTraditional=" << useTraditional << std::endl;
-    // }
     for (u64& pid : toEvict) {
-        if (useTraditional) {
-            releaseFrame(pid);
-        }
+        releaseFrame(pid);
         bool succ = residentSet.remove(pid);
         assert(succ);
-        if (useTraditional && ((hashMode == HashMode::Array1Access && translationRefCounts) || 
-                               (hashMode == HashMode::Array2Level && pageState2Level))) {
+        if (!((hashMode == HashMode::Array1Access && translationRefCounts) ||
+              (hashMode == HashMode::Array2Level && pageState2Level))) {
             // unlockXEvicted has been handled in releaseFrame for hole-punching case
-        } else {
             getPageState(pid).unlockXEvicted();
         }
-        
+
     }
 
     physUsedCount -= toEvict.size();
@@ -2196,58 +2251,70 @@ void BufferManager::evict() {
 
 void BufferManager::forceEvictPortion(float portion) {
     if (portion <= 0.0f || portion > 1.0f) {
-        CALIBY_LOG_WARN("BufferManager", "forceEvictPortion: Invalid portion ", portion, 
+        CALIBY_LOG_WARN("BufferManager", "forceEvictPortion: Invalid portion ", portion,
                         ", must be between 0.0 and 1.0");
         return;
     }
-    
-    if (!useTraditional) {
-        CALIBY_LOG_WARN("BufferManager", "forceEvictPortion: Only supported in traditional mode");
-        return;
-    }
-    
+
     u64 currentUsed = physUsedCount.load(std::memory_order_relaxed);
     u64 targetEvictions = static_cast<u64>(currentUsed * portion);
     if (targetEvictions == 0) {
-        CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: No pages to evict (physUsedCount=", 
+        CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: No pages to evict (physUsedCount=",
                          currentUsed, ")");
         return;
     }
-    
-    CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: Forcing eviction of ", targetEvictions, 
+
+    CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: Forcing eviction of ", targetEvictions,
                      " pages (", (portion * 100), "% of ", currentUsed, " resident pages)");
-    CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: physCount=", physCount, 
-                     ", batch size=", batch);
-    
-    u64 evicted = 0;
-    u64 iterations = 0;
-    const u64 maxIterations = (targetEvictions / batch) + 10;  // Safety limit
-    
-    while (evicted < targetEvictions && iterations < maxIterations) {
-        u64 before = physUsedCount.load(std::memory_order_relaxed);
-        
-        CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: Iteration ", iterations, 
-                         ": physUsedCount=", before, ", calling evict()...");
-        
-        evict();
-        
-        u64 after = physUsedCount.load(std::memory_order_relaxed);
-        u64 evictedThisRound = (before > after) ? (before - after) : 0;
-        evicted += evictedThisRound;
-        iterations++;
-        
-        CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: Iteration ", iterations, 
-                         " complete: evicted ", evictedThisRound, " pages");
-        
-        if (evictedThisRound == 0) {
-            // No more pages can be evicted
-            break;
+    // Direct full-table scan instead of evict()'s clock sweep: the resident-set
+    // hash table is sized physCount but can be sparsely filled (e.g. right after
+    // boot), so the clock sweep can take ~count/used sweeps to gather a batch
+    // (hours at 0.04% occupancy). A linear scan always makes progress.
+    u64 gsnLimit = flushedGsnLimit();
+    vector<PID> toWrite;
+    vector<PID> toEvict;
+    vector<u64> toWriteGsn;
+    // classify one candidate page: dirty+gated+lockable -> toWrite, clean -> toEvict, else skip
+    auto consider = [&](PID pid, PageState& ps, u64 v) {
+        if (!evictable(pid)) return;  // no backing file / global NS: keep resident
+        Page* page = residentPtr(pid);
+        u64 page_gsn = page->p_gsn;
+        if (page_gsn > lastWrittenGsnOf(pid)) {  // derived dirty
+            if (page_gsn <= gsnLimit && ps.tryLockS(v)) {  // WAL gate
+                toWrite.push_back(pid);
+                toWriteGsn.push_back(page_gsn);
+            }
+            // gated or lock contention: skip, page stays resident
+        } else {
+            toEvict.push_back(pid);
+        }
+    };
+    for (u64 i = 0; i < residentSet.count && toEvict.size() < targetEvictions; ++i) {
+        PID pid = residentSet.ht[i].pid.load();
+        if (pid == residentSet.empty || pid == residentSet.tombstone) continue;
+        PageState& ps = getPageState(pid);
+        u64 v = ps.stateAndVersion;
+        switch (PageState::getState(v)) {
+            case PageState::Unlocked:
+                if (!evictable(pid)) break;  // don't even mark pinned pages
+                if (ps.tryMark(v)) {
+                    v = ps.stateAndVersion.load();  // tryMark may change state+version
+                    consider(pid, ps, v);
+                }
+                break;
+            case PageState::Marked:
+                consider(pid, ps, v);
+                break;
+            default:
+                break;  // currently locked by another thread: skip
         }
     }
-    
-    CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: Evicted ", evicted, " pages in ", 
-                     iterations, " iterations");
-    CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: holePunchCount=", holePunchCount.load());
+    if (toEvict.size() == 0 && toWrite.size() == 0) {
+        CALIBY_LOG_DEBUG("BufferManager", "forceEvictPortion: nothing evictable (all pages fixed?)");
+        return;
+    }
+    // Steps 2..5 of evict(): write dirty pages, lock clean candidates, evict
+    evictCandidates(std::move(toEvict), std::move(toWrite), std::move(toWriteGsn));
 }
 
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
@@ -2276,7 +2343,7 @@ void BufferManager::prefetchPagesSingleLevel(const PID* pages, int n_pages, cons
     // Check which pages are not in memory and need to be loaded
     for (int i = 0; i < n_pages; i++) {
         PID pid = pages[i];
-        
+
         if (i + 1 < n_pages) {
             // Prefetch next PageState
             //PageState& next_ps = getPageState(pages[i + 1]);
@@ -2357,12 +2424,12 @@ void BufferManager::prefetchPages2Level(const PID* pages, int n_pages, const u32
         u32 indexId = TwoLevelPageStateArray::getIndexId(pages[0]);
         indexArray = pageState2Level->getIndexArray(indexId);
     }
-    
+
     // Early return if no pages to prefetch
     if (n_pages == 0 || indexArray == nullptr) {
         return;
     }
-    
+
     auto pageStates = indexArray->pageStates;
 
     // prefetch state of all pages
@@ -2377,7 +2444,7 @@ void BufferManager::prefetchPages2Level(const PID* pages, int n_pages, const u32
     // Check which pages are not in memory and need to be loaded
     for (int i = 0; i < n_pages; i++) {
         PID pid = pages[i];
-        
+
         if (i + 1 < n_pages) {
             // Prefetch next PageState - same index so use same array
             PageState& next_ps = pageStates[pid & TwoLevelPageStateArray::LOCAL_PAGE_MASK];
@@ -2799,12 +2866,12 @@ BTree::BTree() : splitOrdered(false) {
         AllocGuard<BTreeNode> rootNode(&pidAllocator, true);
         rootNodePid = rootNode.pid;
     }
-    
+
     {
         GuardX<MetaDataPage> page(metadataPageId);
         slotId = btreeslotcounter++;
         page->roots[slotId] = rootNodePid;
-        page->dirty = true;
+        markPageDirty(page);
     }
 }
 
@@ -2814,7 +2881,7 @@ BTree::BTree(unsigned existingSlotId) : slotId(existingSlotId), splitOrdered(fal
     if (existingSlotId >= btreeslotcounter) {
         btreeslotcounter = existingSlotId + 1;
     }
-    
+
     // Verify the slot has a valid root PID in the metadata page
     {
         GuardO<MetaDataPage> meta(metadataPageId);
@@ -2862,7 +2929,7 @@ void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<
         newRoot->upperInnerNode = node.pid;
         {
             meta_page->roots[slotId] = newRoot.pid;
-            meta_page->dirty = true;
+            markPageDirty(meta_page);
         }
         parent = std::move(newRoot);
     }
@@ -2987,7 +3054,7 @@ u64 BufferManager::countZeroRefCountGroups() {
     u64 entriesPerOSPage = translationOSPageSize / sizeof(PageState);
     u64 currentAllocCount = allocCount.load(std::memory_order_relaxed);
     u64 estimatedNumRefCountGroups = (currentAllocCount + entriesPerOSPage - 1) / entriesPerOSPage;
-    
+
     for (u64 i = 0; i < estimatedNumRefCountGroups; i++) {
         u32 val = translationRefCounts[i].load(std::memory_order_relaxed);
         if ((val & REF_COUNT_MASK) == 0) {
@@ -3031,7 +3098,7 @@ void initialize_system() {
         snprintf(physgb_str, sizeof(physgb_str), "%.2f", config_physgb);
         setenv("VIRTGB", virtgb_str, 0);
         setenv("PHYSGB", physgb_str, 0);
-        
+
         bm_ptr = new BufferManager();
 
         // NOTE: catalog.initialize() is NOT called here - it must be explicitly

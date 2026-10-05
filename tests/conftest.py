@@ -120,7 +120,16 @@ def temp_dir(temp_dir_session):
 
 @pytest.fixture(scope="module")
 def caliby_module(caliby_module_session):
-    """Module-scoped alias for caliby_module_session."""
+    """Module-scoped alias for caliby_module_session.
+
+    Closes any lifecycle state a previous module left behind (its buffer
+    manager, catalog) so every module starts with a clean catalog and may
+    initialize any directory it owns.
+    """
+    try:
+        caliby_module_session.close()
+    except Exception:
+        pass
     return caliby_module_session
 
 

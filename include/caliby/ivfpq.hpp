@@ -86,7 +86,7 @@ using IVFPQMetaInfo = IVFPQMetaInfoCompact;
 
 // Detailed metadata page
 struct IVFPQMetadataPage {
-    bool dirty;
+    u64 p_gsn = 0;
     u8 _padding1[7];
     
     u32 dim;
@@ -112,11 +112,11 @@ struct IVFPQMetadataPage {
 
 // Centroid page - stores cluster centers
 struct CentroidPage {
-    bool dirty;
+    u64 p_gsn = 0;
     u32 centroid_count;
     u8 padding[4];
     
-    static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(centroid_count) + sizeof(padding);
+    static constexpr size_t HeaderSize = sizeof(p_gsn) + sizeof(centroid_count) + sizeof(padding);
     
     float* getCentroidData() { return reinterpret_cast<float*>(reinterpret_cast<u8*>(this) + HeaderSize); }
     const float* getCentroidData() const { return reinterpret_cast<const float*>(reinterpret_cast<const u8*>(this) + HeaderSize); }
@@ -148,12 +148,12 @@ struct InvListEntry {
 
 // Inverted list directory page - contains InvListEntry for multiple clusters
 struct InvListDirPage {
-    bool dirty;
+    u64 p_gsn = 0;
     u32 entry_count;
     u32 first_cluster_id;  // First cluster ID on this page
     u8 padding[4];
     
-    static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(entry_count) + sizeof(first_cluster_id) + sizeof(padding);
+    static constexpr size_t HeaderSize = sizeof(p_gsn) + sizeof(entry_count) + sizeof(first_cluster_id) + sizeof(padding);
     
     InvListEntry* getEntries() { return reinterpret_cast<InvListEntry*>(reinterpret_cast<u8*>(this) + HeaderSize); }
     const InvListEntry* getEntries() const { return reinterpret_cast<const InvListEntry*>(reinterpret_cast<const u8*>(this) + HeaderSize); }
@@ -177,13 +177,13 @@ struct alignas(4) PQCodeEntry {
 
 // Inverted list data page - stores PQ-encoded vectors
 struct InvListDataPage {
-    bool dirty;
+    u64 p_gsn = 0;
     PID next_page;             // Next page in linked list
     u32 count;                 // Number of entries in this page
     u32 capacity;              // Max entries this page can hold
     u8 padding[4];
     
-    static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(next_page) + sizeof(count) + sizeof(capacity) + sizeof(padding);
+    static constexpr size_t HeaderSize = sizeof(p_gsn) + sizeof(next_page) + sizeof(count) + sizeof(capacity) + sizeof(padding);
     
     u8* getEntryData() { return reinterpret_cast<u8*>(this) + HeaderSize; }
     const u8* getEntryData() const { return reinterpret_cast<const u8*>(this) + HeaderSize; }
@@ -205,7 +205,7 @@ struct InvListDataPage {
 // Since 256 codes * subvec_dim floats may not fit in one page, 
 // we split across multiple pages
 struct PQCodebookPage {
-    bool dirty;
+    u64 p_gsn = 0;
     u32 subquantizer_id;      // Which subquantizer this page belongs to
     u32 subvector_dim;        // Dimension of each code vector
     u32 page_index;           // Which page of the codebook (0, 1, 2, ...)
@@ -213,7 +213,7 @@ struct PQCodebookPage {
     u32 code_count;           // Number of codes on this page
     u8 padding[4];
     
-    static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(subquantizer_id) + 
+    static constexpr size_t HeaderSize = sizeof(p_gsn) + sizeof(subquantizer_id) + 
         sizeof(subvector_dim) + sizeof(page_index) + sizeof(start_code) + 
         sizeof(code_count) + sizeof(padding);
     

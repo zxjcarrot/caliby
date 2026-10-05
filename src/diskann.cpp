@@ -78,7 +78,7 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::MutableNodeAccessor::MutableNodeAccessor(
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::MutableNodeAccessor::setVector(const T* vector) {
     memcpy(const_cast<uint8_t*>(this->_node_start), vector, VectorSize);
-    _page->dirty = true;
+    markPageDirty(_page);
 }
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::MutableNodeAccessor::setTags(const std::vector<TagT>& tags) {
@@ -87,7 +87,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::MutableNodeAccessor::setTags(const s
     size_t count_to_copy = std::min(tags.size(), MaxTagsPerNode);
     *count_ptr = static_cast<uint16_t>(count_to_copy);
     memcpy(tags_start, tags.data(), count_to_copy * sizeof(TagT));
-    _page->dirty = true;
+    markPageDirty(_page);
 }
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::MutableNodeAccessor::setNeighbors(const std::vector<uint32_t>& neighbors) {
@@ -97,7 +97,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::MutableNodeAccessor::setNeighbors(co
     size_t count_to_copy = std::min(neighbors.size(), this->_index->_R_max_degree);
     *count_ptr = static_cast<uint16_t>(count_to_copy);
     memcpy(neighbors_start, neighbors.data(), count_to_copy * sizeof(uint32_t));
-    _page->dirty = true;
+    markPageDirty(_page);
 }
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 ThreadPool* DiskANN<T, TagT, Dim, MaxTagsPerNode>::getOrCreateThreadPool(size_t num_threads) const {
@@ -132,7 +132,7 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::DiskANN(uint64_t max_elements, size_t R_m
 
     AllocGuard<DiskANNMetadataPage> meta_guard(_allocator);
     _metadata_pid = meta_guard.pid;  // Already a global PID from AllocGuard
-    meta_guard->dirty = false;
+    markPageClean(meta_guard);
     meta_guard->max_elements = _max_elements;
     meta_guard->node_count = 0;
     meta_guard->alloc_count.store(1, std::memory_order_relaxed);
@@ -144,15 +144,15 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::DiskANN(uint64_t max_elements, size_t R_m
         AllocGuard<VamanaPage> first_page_guard(_allocator);
         _base_pid = first_page_guard.pid;  // Already a global PID
         meta_guard->base_pid = _base_pid;
-        first_page_guard->dirty = false;
+        markPageClean(first_page_guard);
         first_page_guard->node_count_in_page = 0;
         for (uint64_t i = 1; i < num_pages; ++i) {
             AllocGuard<VamanaPage> page_guard(_allocator);
-            page_guard->dirty = false;
+            markPageClean(page_guard);
             page_guard->node_count_in_page = 0;
         }
     }
-    meta_guard->dirty = true;
+    markPageDirty(meta_guard);
 
     _visited_list_pool = std::make_unique<VisitedListPool>(1, _max_elements);
     if (_is_dynamic) _internal_to_external_map.reserve(_max_elements);

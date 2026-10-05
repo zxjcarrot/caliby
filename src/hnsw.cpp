@@ -174,7 +174,7 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
     } else {
         if (has_existing_meta) {
             meta_info->valid = 0;
-            meta_page_guard->dirty = true;
+            markPageDirty(meta_page_guard);
             CALIBY_LOG_INFO("HNSW", "Recovery: Existing metadata invalidated for rebuild");
         }
 
@@ -193,15 +193,19 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
             meta_guard->node_count.store(0);
             meta_guard->enter_point_node_id = HNSWMetadataPage::invalid_node_id;
             meta_guard->max_level.store(0);
-            meta_guard->dirty = true;
+            markPageDirty(meta_guard);
             CALIBY_LOG_INFO("HNSW", "Recovery: Reusing metadata page ", this->metadata_pid, " and base_pid ",
                       this->base_pid, "; counters reset");
 
             u64 total_pages = (max_elements + NodesPerPage - 1) / NodesPerPage;
+            bm.ensureCapacityForPid(this->base_pid, total_pages + (this->base_pid & 0xFFFFFFFFULL));
             for (u64 i = 0; i < total_pages; ++i) {
                 GuardX<HNSWPage> page_guard(this->base_pid + i);
+                // Fresh claim: the backing file may hold a previous run's data whose
+                // layout differs; zero the whole page so no stale bytes are re-read.
+                zeroFullPage(page_guard.ptr);
                 page_guard->node_count = 0;
-                page_guard->dirty = true;
+                markPageDirty(page_guard);
             }
             CALIBY_LOG_DEBUG("HNSW", "Recovery: Reset ", total_pages, " data pages");
         } else {
@@ -210,7 +214,7 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
             AllocGuard<HNSWMetadataPage> meta_guard(allocator_);
             this->metadata_pid = meta_guard.pid;  // Already a global PID from AllocGuard
 
-            meta_guard->dirty = false;
+            markPageClean(meta_guard);
             meta_guard->base_pid = -1;
             meta_guard->max_elements = max_elements;
             meta_guard->node_count.store(0);
@@ -222,13 +226,13 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
             // when vectors are added. This avoids pre-allocating 10M pages for large max_elements.
             AllocGuard<HNSWPage> first_page_guard(allocator_);
             meta_guard->base_pid = first_page_guard.pid;  // Already a global PID
-            first_page_guard->dirty = false;
+            zeroFullPage(first_page_guard.ptr);
             first_page_guard->node_count = 0;
-            first_page_guard->dirty = true;
+            markPageDirty(first_page_guard);
             meta_guard->alloc_count.store(1, std::memory_order_relaxed);  // 1 page allocated
 
             this->base_pid = meta_guard->base_pid;
-            meta_guard->dirty = true;
+            markPageDirty(meta_guard);
             CALIBY_LOG_INFO("HNSW", "Recovery: Allocated new metadata page ", this->metadata_pid,
                       " base_pid=", this->base_pid, " (pages allocated on-demand)");
 
@@ -249,7 +253,7 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
         meta_info->max_level = MaxLevel;
         meta_info->alloc_count.store(0, std::memory_order_relaxed);
         meta_info->valid = 1;
-        meta_page_guard->dirty = true;
+        markPageDirty(meta_page_guard);
         CALIBY_LOG_INFO("HNSW", "Recovery: Metadata page updated and marked valid");
     }
 
@@ -725,15 +729,18 @@ void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id
                 // Access the page directly - this will create it if it doesn't exist
                 GuardX<HNSWPage> new_page_guard(page_pid);
                 
+                // Fresh claim: zero the whole page so stale file bytes (layout
+                // mismatch from earlier runs) cannot leak into node slots.
+                zeroFullPage(new_page_guard.ptr);
                 // Initialize the new page
                 new_page_guard->node_count = 0;
-                new_page_guard->dirty = true;
+                markPageDirty(new_page_guard);
             }
             
             // Update alloc_count to include all newly allocated pages
             u64 new_alloc_count = required_page_num + 1;
             meta_guard->alloc_count.store(new_alloc_count, std::memory_order_release);
-            meta_guard->dirty = true;
+            markPageDirty(meta_guard);
             
             // CRITICAL: Also update IndexTranslationArray::allocCount so flushAll knows
             // about these pages. Without this, pages won't be flushed on close!
@@ -782,7 +789,7 @@ void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id
 
         // Update page metadata
         page->node_count = std::max(page->node_count, static_cast<u16>(node_idx + 1));
-        page->dirty = true;
+        markPageDirty(page);
     }
 
     // --- 2. Find the global entry point for the search ---
@@ -811,7 +818,7 @@ void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id
             // Still invalid, we are the first node
             meta_guard->enter_point_node_id = new_node_id;
             meta_guard->max_level.store(new_node_level, std::memory_order_release);
-            meta_guard->dirty = true;
+            markPageDirty(meta_guard);
             return;
         } else {
             // Another thread beat us to it, re-read the entry point
@@ -912,12 +919,6 @@ void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id
                             connections_to_prune.push({dist_point_to_neighbor, new_node_id});
                             
                             for (u32 conn_id : latest_neighbors_span) {
-                                // auto it = connection_vectors.find(conn_id);
-                                // if (it != connection_vectors.end()) {
-                                //     const std::vector<float>& conn_vector = it->second;
-                                //     float dist = DistanceMetric::compare(neighbor_vector_copy.data(), conn_vector.data(), Dim);
-                                //     connections_to_prune.push({dist, conn_id});
-                                // }
                                 GuardORelaxed<HNSWPage> conn_page_guard(getNodePID(conn_id), index_array);
                                 NodeAccessor conn_acc(conn_page_guard.ptr, getNodeIndexInPage(conn_id), this);
                                 const float* conn_vec_ptr = conn_acc.getVector();
@@ -1028,7 +1029,7 @@ void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id
         if (new_node_level > meta_guard->max_level.load(std::memory_order_acquire)) {
             meta_guard->enter_point_node_id = new_node_id;
             meta_guard->max_level.store(new_node_level, std::memory_order_release);
-            meta_guard->dirty = true;
+            markPageDirty(meta_guard);
             
             // CRITICAL: Ensure old entry point remains reachable from new entry point
             // When entry point changes, we must create a bidirectional link at level 0
@@ -1153,7 +1154,7 @@ void HNSW<DistanceMetric>::addPoint_parallel(std::span<const float> points, size
             throw std::runtime_error("Cannot add items; index would exceed max_elements.");
         }
         meta_guard->node_count.store(start_id + num_points);
-        meta_guard->dirty = true;
+        markPageDirty(meta_guard);
     }
     size_t threads_to_use = (num_threads == 0) ? std::thread::hardware_concurrency() : num_threads;
     threads_to_use = std::min(threads_to_use, num_points);
@@ -1227,7 +1228,7 @@ void HNSW<DistanceMetric>::addPointsWithIdsParallel(const std::vector<const floa
             }
             meta_guard->node_count.store(max_id + 1);
         }
-        meta_guard->dirty = true;
+        markPageDirty(meta_guard);
     }
     
     size_t threads_to_use = (num_threads == 0) ? std::thread::hardware_concurrency() : num_threads;
@@ -1851,7 +1852,7 @@ void HNSW<DistanceMetric>::addPoint(const float* point, u32& node_id_out) {
             meta_guard->node_count.fetch_sub(1);
             throw std::runtime_error("HNSW index is full.");
         }
-        meta_guard->dirty = true;
+        markPageDirty(meta_guard);
     }
     node_id_out = new_node_id;
     addPoint_internal(point, new_node_id);
@@ -1869,7 +1870,7 @@ void HNSW<DistanceMetric>::addPointWithId(const float* point, u32 node_id) {
         if (node_id >= current_count) {
             meta_guard->node_count.store(node_id + 1);
         }
-        meta_guard->dirty = true;
+        markPageDirty(meta_guard);
     }
     addPoint_internal(point, node_id);
 }

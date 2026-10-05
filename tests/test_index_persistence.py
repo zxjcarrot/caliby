@@ -23,6 +23,10 @@ class TestIndexFilePersistence:
     def setup_teardown(self):
         """Create and cleanup test directory for each test."""
         self.test_dir = tempfile.mkdtemp(prefix="caliby_test_")
+        try:
+            caliby.close()  # Close any catalog opened by an earlier module.
+        except Exception:
+            pass
         yield
         # Cleanup
         if os.path.exists(self.test_dir):
@@ -132,6 +136,10 @@ class TestIndexPersistenceAndFlush:
     def setup_teardown(self):
         """Create and cleanup test directory for each test."""
         self.test_dir = tempfile.mkdtemp(prefix="caliby_test_")
+        try:
+            caliby.close()  # Close any catalog opened by an earlier module.
+        except Exception:
+            pass
         yield
         # Cleanup
         if os.path.exists(self.test_dir):
@@ -197,6 +205,10 @@ class TestIndexRecovery:
     def setup_teardown(self):
         """Create and cleanup test directory for each test."""
         self.test_dir = tempfile.mkdtemp(prefix="caliby_test_")
+        try:
+            caliby.close()  # Close any catalog opened by an earlier module.
+        except Exception:
+            pass
         yield
         # Cleanup
         if os.path.exists(self.test_dir):
@@ -283,6 +295,10 @@ class TestCatalogPersistence:
     def setup_teardown(self):
         """Create and cleanup test directory for each test."""
         self.test_dir = tempfile.mkdtemp(prefix="caliby_test_")
+        try:
+            caliby.close()  # Close any catalog opened by an earlier module.
+        except Exception:
+            pass
         yield
         # Cleanup
         if os.path.exists(self.test_dir):

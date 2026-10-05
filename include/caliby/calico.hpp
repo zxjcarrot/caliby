@@ -29,7 +29,6 @@
 extern __thread uint16_t workerThreadId;
 extern __thread int32_t tpcchistorycounter;
 
-#include "exmap.h"
 #include "tpcc/TPCCWorkload.hpp"
 #include "tpcc/ZipfianGenerator.hpp"
 
@@ -51,11 +50,16 @@ struct Hasher {
 };
 
 struct alignas(pageSize) Page {
-    bool dirty;
+    // Page-level GSN (LeanStore-style). The authoritative "dirty" state of
+    // a page is now DERIVED: a page is dirty iff
+    //   frame_meta[pid].last_written_gsn < page->p_gsn
+    // Page::p_gsn travels with the page image; guards bump it on every
+    // exclusive fix (Phase 3: on every WAL-emitting mutation).
+    u64 p_gsn = 0;
 };
 
 struct GraphNodePage {
-    bool dirty;
+    u64 p_gsn = 0;
     u32 neighborCount;
     u32 padding;
     u64 value;
@@ -274,14 +278,13 @@ struct IOInterface {
 struct LibaioInterface: public IOInterface {
     static const u64 maxIOs = 256;
 
-    int blockfd;
     BufferManager* bm_ptr;
     io_context_t ctx;
     iocb cb[maxIOs];
     iocb* cbPtr[maxIOs];
     io_event events[maxIOs];
 
-    LibaioInterface(int blockfd, BufferManager* bm_ptr);
+    explicit LibaioInterface(BufferManager* p);
     ~LibaioInterface() { io_destroy(ctx); }
     virtual void writePages(const std::vector<PID>& pages);
     virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations);
@@ -292,7 +295,6 @@ struct IOUringInterface: public IOInterface {
     static const u64 maxIOs = 256;
     static const u64 queueDepth = 512;
 
-    int blockfd;
     BufferManager* bm_ptr;
     struct io_uring ring;
 
@@ -314,6 +316,11 @@ struct FreePartition {
 // Per-Index Translation Array with Hole-Punching Support
 //=============================================================================
 
+/* Storing metadata of all buffer frames */
+struct BufferFrame {
+    std::atomic<u64> lastWrittenGsn{0};
+    u16 lastWriter{0};
+};
 /**
  * Per-index translation array supporting atomic hole-punching.
  * Each index gets its own translation array that can be lazily allocated.
@@ -338,7 +345,26 @@ struct IndexTranslationArray {
     // Cached information for translation path caching
     int file_fd;                         // File descriptor for this index's data file
     u32 index_id;                        // Index ID for quick lookup
-    
+    // Per-local-page write tracking (LeanStore frame_meta): last_written_gsn
+    // is the highest page-p_gsn whose image was written out to this index's
+    // file; last_writer remembers which worker last wrote the page (used by
+    // DetectGSNDependency in Phase 3).
+    BufferFrame* frames = nullptr;
+    inline u64 lastWrittenGsnOf(u64 localPageId) {
+        assert(frames != nullptr);
+        return frames[localPageId].lastWrittenGsn.load(std::memory_order_relaxed);
+    }
+    inline void setLastWrittenGsn(u64 localPageId, u64 gsn) {
+        assert(frames != nullptr);
+        u64 cur = frames[localPageId].lastWrittenGsn.load(std::memory_order_relaxed);
+        while (gsn > cur &&
+               !frames[localPageId].lastWrittenGsn.compare_exchange_weak(cur, gsn,
+                                                                   std::memory_order_relaxed)) {}
+    }
+    inline void setLastWriter(u64 localPageId, u16 w) {
+        assert(frames != nullptr);
+        frames[localPageId].lastWriter = w;
+    }
     IndexTranslationArray(u32 indexId, u64 maxPages, u64 initialAllocCount = 0, int fd = -1);
     ~IndexTranslationArray();
     
@@ -399,8 +425,8 @@ struct TwoLevelPageStateArray {
     
     // Generation counter - incremented when indexes are unregistered
     // Used to invalidate thread-local caches
-    std::atomic<u64> generation{0};
-    
+    std::atomic<u64> generation{genClock.fetch_add(1) + 1};
+    static std::atomic<u64> genClock;
     // Reference to BufferManager's hole punch counter
     std::atomic<u64>* holePunchCounterPtr;
     
@@ -456,29 +482,22 @@ struct TwoLevelPageStateArray {
         // Fast path: use thread-local cache for repeated access to same index
         // The cache stores the last accessed IndexTranslationArray pointer
         // Also cache generation to detect invalidation
-        thread_local u32 cachedIndexId = 0xFFFFFFFF;
-        thread_local IndexTranslationArray* cachedArray = nullptr;
-        thread_local u64 cachedGeneration = 0;
-        
-        u64 currentGen = generation.load(std::memory_order_acquire);
-        
-        if (cachedIndexId == indexId && cachedGeneration == currentGen && cachedArray != nullptr) {
-            // Cache hit - use cached array pointer
+        static thread_local const TwoLevelPageStateArray* cachedOwner = nullptr;
+        static thread_local u32 cachedIndexId = 0;
+        static thread_local u64 cachedGeneration = 0;
+        static thread_local IndexTranslationArray* cachedArray = nullptr;
+        u64 gen = generation.load(std::memory_order_relaxed);
+        if (cachedOwner == this && cachedIndexId == indexId &&
+            cachedGeneration == gen && cachedArray != nullptr) {
             return cachedArray->get(localPageId);
         }
-        IndexTranslationArray* arr;
-
-        // Cache miss - lookup in top-level array
-        if (indexId == 0 && defaultArray != nullptr) {
-            arr = defaultArray;
-        } else {
-            arr = indexArrays[indexId];
-        }
-        // Update cache
+        IndexTranslationArray* arr = (indexId == 0 && defaultArray != nullptr)
+                                         ? defaultArray
+                                         : indexArrays[indexId].load(std::memory_order_acquire);
+        cachedOwner = this;
         cachedIndexId = indexId;
+        cachedGeneration = gen;
         cachedArray = arr;
-        cachedGeneration = currentGen;
-        
         return arr->get(localPageId);
     }
 
@@ -661,18 +680,19 @@ struct BufferManager {
     u64 physSize;
     u64 virtCount;
     u64 physCount;
-    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
 
     enum class HashMode { Array1Access = 0, Unordered = 1, OpenAddress = 2, Array = 3, Lockfree = 4, Array2Level = 5, Array3Level = 6 };
 
     bool useTraditional;
     bool useMmapOSPageacche = false;
-    bool useExmap;
     HashMode hashMode;
     unsigned numThreads;
-    int blockfd;
-    int exmapfd;
 
+    // Global FD, used to refer to index-0 backing file into the pre-allocated frame
+    void setGlobalNamespaceFd(int fd);
+    void reloadGlobalMetadataPage();
+    void ensureCapacityForPid(PID pid, u64 localPageId);
+    bool evictable(PID pid);
     static constexpr u64 invalidFrame = std::numeric_limits<u64>::max();
     static constexpr PID invalidPID = std::numeric_limits<PID>::max();
     static constexpr u32 freePartitionCount = 64;
@@ -691,6 +711,29 @@ struct BufferManager {
     std::atomic<u64> holePunchCount;  // Counter for translation table hole-punching operations
     char cachline_pad5[64];
 
+    // -------------------- GSN / dirty-tracking ---------------------------
+    static std::atomic<u64> pageGsnClock;
+    static inline u64 advancePageGSN() { return pageGsnClock.fetch_add(1, std::memory_order_relaxed) + 1; }
+    static inline u64 nextPageGSN() { return pageGsnClock.load(std::memory_order_relaxed) + 1; }
+    static inline void syncPageGSNClock(u64 cl) {
+        u64 cur = pageGsnClock.load(std::memory_order_relaxed);
+        while (cl > cur && !pageGsnClock.compare_exchange_weak(cur, cl, std::memory_order_relaxed)) {}
+    }
+    // Durable frontier that gates dirty-page write-back, used for checkpointing
+    // With the WAL disabled, this is +inf, so the gate is a no-op.
+    static u64 flushedGsnLimit();
+    // Dirty state of a resident page, derived from the GSN comparison.
+    // Requires the page to be resident (pid mapped to a frame).
+    bool pageIsDirty(PID pid);
+    // Record that a page image was written out: raises last_written_gsn for
+    // `pid` up to `written_gsn` (monotonic max). Called after a successful
+    // synchronous write of that page image.
+    // Last-written-GSN + last-writer bookkeeping, per (index, local pid).
+    // Delegates to the owning IndexTranslationArray.
+    u64 lastWrittenGsnOf(PID pid);
+    void updateLastWrittenGsn(PID pid, u64 gsn);
+    void setLastWriter(PID pid, uint16_t w_id);
+    uint16_t lastWriterOf(PID pid);
     // Index Catalog for per-index allocation tracking
     std::unique_ptr<IndexCatalog> indexCatalog;
     std::unordered_map<u32, std::unique_ptr<PIDAllocator>> perIndexAllocators;
@@ -741,12 +784,10 @@ struct BufferManager {
 
     bool isValidPtr(void* page);
     PID toPID(void* page);
-    Page* toPtr(PID pid);
     Page* residentPtr(PID pid);
     Page* residentPtr(PID pid, u64 stateAndVersion);
     Page* residentPtrCalico(PID pid, u64 stateAndVersion);
     Page* residentPtrHash(PID pid, u64 stateAndVersion);
-    Page* preparePageForWrite(PID pid);
 
     void ensureFreePages();
     Page* allocPage(PIDAllocator* allocator = nullptr);
@@ -759,6 +800,7 @@ struct BufferManager {
     void readPage(PID pid, Page* dest);
     void evict();
     void forceEvictPortion(float portion = 0.5);  // Force eviction of a portion of buffer pool for testing
+    void evictCandidates(vector<PID> toEvict, vector<PID> toWrite, vector<u64> toWriteGsn);
     void prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
     void prefetchPagesSingleLevel(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
     void prefetchPages2Level(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
@@ -781,7 +823,7 @@ struct BufferManager {
      * In Array2Level mode, extracts index_id from PID and looks up the corresponding file descriptor.
      * @param pid Global page ID
      * @param localPageId Output parameter for local page ID within the index
-     * @return File descriptor for the index, or blockfd if not using Array2Level
+     * @return File descriptor for the index, or -1 if none registered
      */
     int getFileDescriptorForPID(PID pid, PID& localPageId);
     
@@ -905,6 +947,16 @@ struct BufferManager {
 };
 typedef u64 KeyType;
 
+inline void zeroFullPage(void* page) { memset(page, 0, pageSize); }
+
+// GSN dirty helper: replaces the legacy `page->dirty = true` writes. Bumps the
+// page's p_gsn from the global page-GSN clock; "dirty" is now derived from
+// p_gsn vs. frame last_written_gsn (see BufferManager::pageIsDirty).
+template <class T>
+inline void markPageDirty(T* page) {
+    assert(page != nullptr);
+    page->p_gsn = BufferManager::advancePageGSN();
+}
 extern BufferManager* bm_ptr;
 // Flag to track if the system has been closed (index arrays unregistered)
 extern bool system_closed;
@@ -1304,7 +1356,7 @@ struct GuardX {
     // constructor
     explicit GuardX(u64 pid) : pid(pid) {
         ptr = reinterpret_cast<T*>(bm.fixX(pid));
-        ptr->dirty = true;
+        markPageDirty(ptr);
     }
 
     explicit GuardX(GuardO<T>&& other) {
@@ -1318,7 +1370,7 @@ struct GuardX {
                 if (ps.tryLockX(stateAndVersion)) {
                     pid = other.pid;
                     ptr = other.ptr;
-                    ptr->dirty = true;
+                    markPageDirty(ptr);
                     other.pid = moved;
                     other.ptr = nullptr;
                     return;
@@ -1373,7 +1425,7 @@ struct AllocGuard : public GuardX<T> {
         GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPageForIndex(indexId, allocator));
         new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
         GuardX<T>::pid = bm.toPID(GuardX<T>::ptr);
-        GuardX<T>::ptr->dirty = true;  // Mark newly allocated page as dirty
+        markPageDirty(GuardX<T>::ptr);
     }
 
     // Default constructor (no allocator, no parameters) - uses index 0
@@ -1381,10 +1433,21 @@ struct AllocGuard : public GuardX<T> {
         GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPage(nullptr));
         new (GuardX<T>::ptr) T();
         GuardX<T>::pid = bm.toPID(GuardX<T>::ptr);
-        GuardX<T>::ptr->dirty = true;  // Mark newly allocated page as dirty
+        markPageDirty(GuardX<T>::ptr);
     }
 };
 
+// Guard-aware dirty helpers (defined after GuardX; see markPageDirty above).
+template <class T>
+inline void markPageDirty(GuardX<T>& guard) {
+    markPageDirty(guard.ptr);
+}
+template <class T>
+inline void markPageClean(GuardX<T>& guard) {
+    // Clean-mark without write-out (old `->dirty = false` semantics):
+    // raise last_written_gsn to the page's current p_gsn.
+    bm.updateLastWrittenGsn(guard.pid, guard.ptr->p_gsn);
+}
 template <class T>
 struct GuardS {
     PID pid;
@@ -1464,7 +1527,7 @@ struct BTreeNodeHeader {
         u16 len;
     };
 
-    bool dirty;
+    u64 p_gsn = 0;
     union {
         PID upperInnerNode;              // inner
         PID nextLeafNode = noNeighbour;  // leaf
@@ -1508,7 +1571,7 @@ struct BTreeNode : public BTreeNodeHeader {
 
     static constexpr unsigned maxKVSize = ((pageSize - sizeof(BTreeNodeHeader) - (2 * sizeof(Slot)))) / 4;
 
-    BTreeNode(bool isLeaf) : BTreeNodeHeader(isLeaf) { dirty = true; }
+    BTreeNode(bool isLeaf) : BTreeNodeHeader(isLeaf) { markPageDirty(this); }
 
     u8* ptr() { return reinterpret_cast<u8*>(this); }
     bool isInner() { return !isLeaf; }
@@ -1652,12 +1715,12 @@ struct IVFPQMetaInfoCompact {
 };
 
 struct MetaDataPage {
-    bool dirty;
+    u64 p_gsn = 0;
     u8 padding[7] = {0};
     HNSWMetaInfo hnsw_meta;
     IVFPQMetaInfoCompact ivfpq_meta;
     u64 alloc_count_snapshot = 0;
-    PID roots[(pageSize - sizeof(dirty) - sizeof(padding) - sizeof(HNSWMetaInfo) - sizeof(IVFPQMetaInfoCompact) - sizeof(alloc_count_snapshot)) /
+    PID roots[(pageSize - sizeof(p_gsn) - sizeof(padding) - sizeof(HNSWMetaInfo) - sizeof(IVFPQMetaInfoCompact) - sizeof(alloc_count_snapshot)) /
               sizeof(PID)];
 
     PID getRoot(unsigned slot) { return roots[slot]; }

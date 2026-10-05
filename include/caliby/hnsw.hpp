@@ -128,7 +128,7 @@ struct HNSWStats {
 
 // --- HNSW Metadata ---
 struct HNSWMetadataPage {
-    bool dirty;
+    u64 p_gsn = 0;
     PID base_pid;                 // The starting Page ID for HNSW data pages.
     u64 max_elements;             // The maximum number of elements the index can hold.
     std::atomic<u64> node_count;  // The total number of nodes currently inserted.
@@ -164,11 +164,11 @@ class HNSW {
 
     // HNSW data page: uses fixed-size node grid layout for direct access.
     struct HNSWPage {
-        bool dirty;
+        u64 p_gsn = 0;
         u16 node_count;
         u16 padding[3];  // Align to 8 bytes
 
-        static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(node_count) + sizeof(padding);
+        static constexpr size_t HeaderSize = sizeof(p_gsn) + sizeof(node_count) + sizeof(padding);
 
         // Get node data area (nodes start immediately after header)
         u8* getNodeData() { return reinterpret_cast<u8*>(this) + HeaderSize; }
@@ -192,7 +192,7 @@ class HNSW {
     PIDAllocator* allocator_;  // Per-index allocator for page allocation
     PID metadata_pid;
     PID base_pid;
-    
+
     // Helper to encode local PID with index_id
     inline PID makeGlobalPID(PID local_pid) const {
         return (static_cast<PID>(index_id_) << 32) | (local_pid & 0xFFFFFFFFULL);
@@ -202,19 +202,19 @@ class HNSW {
     bool enable_prefetch_;
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
     bool recovered_from_disk_ = false;
-    
+
     // `mutable` allows const methods like searchKnn to update stats.
     mutable HNSWStats stats_;
-    
+
     // Thread pools for parallel operations - reused across calls
     mutable std::unique_ptr<class ThreadPool> search_thread_pool_{nullptr};
     mutable size_t search_pool_size_{0};
     mutable std::mutex search_pool_mutex_;
-    
+
     mutable std::unique_ptr<class ThreadPool> add_thread_pool_{nullptr};
     mutable size_t add_pool_size_{0};
     mutable std::mutex add_pool_mutex_;
-    
+
     // Helper method to get or create thread pool
     class ThreadPool* getOrCreateSearchPool(size_t num_threads) const;
     class ThreadPool* getOrCreateAddPool(size_t num_threads) const;
@@ -225,7 +225,7 @@ class HNSW {
         bool skip_recovery = false, uint32_t index_id = 0, const std::string& name = "");
     // Destructor - must be defined in .cpp where ThreadPool is complete
     ~HNSW();
-    
+
     // Get the name of the index
     const std::string& getName() const { return name_; }
 
@@ -240,8 +240,8 @@ class HNSW {
    public:
     // Add a point to the index (auto-assigns sequential node_id).
     void addPoint(const float* point, u32& node_id_out);
-    
-    // Add a point with a specific node_id (e.g., doc_id). 
+
+    // Add a point with a specific node_id (e.g., doc_id).
     // The caller is responsible for ensuring node_id is unique and within max_elements.
     void addPointWithId(const float* point, u32 node_id);
 
@@ -255,7 +255,7 @@ class HNSW {
                                                                        size_t ef_search_param, size_t num_threads = 0);
     // Add a batch of points to the index in parallel.
     void addPoint_parallel(std::span<const float> points, size_t num_threads = 0);
-    
+
     // Add a batch of points with specific IDs in parallel.
     // Useful for Collection where doc_id must be used as node_id.
     void addPointsWithIdsParallel(const std::vector<const float*>& data_ptrs,
@@ -272,7 +272,7 @@ class HNSW {
     std::vector<std::pair<float, u32>> searchKnnFiltered(
         const float* query, size_t k, size_t ef_search_param,
         const std::function<bool(u32)>& filter_fn);
-    
+
     // ACORN-inspired filtered search with 2-hop neighbor expansion and multiple entry points
     // This method provides higher recall for filtered searches by:
     // 1. Using 2-hop neighbor expansion to find paths through non-matching nodes
@@ -442,7 +442,7 @@ class HNSW {
             size_t count_to_copy = std::min(new_neighbors.size(), M_level);
             std::copy(new_neighbors.begin(), new_neighbors.begin() + count_to_copy, level_start_ptr);
             counts_per_level[level] = count_to_copy;
-            page->dirty = true;
+            markPageDirty(page);
         }
 
         bool addNeighbor(u32 level, u32 new_neighbor_id, const HNSW* hnsw_instance) {
@@ -478,7 +478,7 @@ class HNSW {
 
             // Increment the count for this level
             counts_per_level[level]++;
-            page->dirty = true;
+            markPageDirty(page);
 
             return true;
         }

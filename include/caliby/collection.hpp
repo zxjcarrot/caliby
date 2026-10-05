@@ -391,8 +391,7 @@ public:
  * Collection metadata stored in page 0.
  */
 struct CollectionMetadataPage {
-    bool dirty;                         // Page dirty flag (first byte)
-    uint8_t reserved1[7];               // Alignment padding
+    u64 p_gsn = 0;
     
     uint64_t magic;                     // COLLECTION_MAGIC
     uint32_t version;                   // COLLECTION_VERSION
@@ -420,9 +419,7 @@ struct CollectionMetadataPage {
     uint8_t reserved3[920];             // Pad to 4KB (reduced for id_index_btree_slot_id)
     
     void initialize() {
-        // Note: intentionally NOT setting dirty here - caller should manage that
-        // dirty field is at the start of the struct for buffer manager compatibility
-        std::memset(reserved1, 0, sizeof(reserved1));
+        // (p_gsn occupies the first 8 bytes; caller manages GSN via guards)
         magic = COLLECTION_MAGIC;
         version = COLLECTION_VERSION;
         flags = 0;
@@ -458,7 +455,7 @@ static_assert(sizeof(CollectionMetadataPage) <= 4096, "CollectionMetadataPage mu
  * Document page header.
  */
 struct DocumentPageHeader {
-    bool dirty;                         // Page dirty flag
+    u64 p_gsn = 0;
     uint8_t flags;                      // Page flags
     uint16_t slot_count;                // Number of slots
     uint16_t free_space;                // Free space in page
@@ -499,7 +496,7 @@ struct DocumentRecordHeader {
  * Overflow page header.
  */
 struct OverflowPageHeader {
-    bool dirty;
+    u64 p_gsn = 0;
     uint8_t reserved1[7];
     uint64_t parent_doc_id;             // Document this belongs to
     uint32_t continuation_length;       // Data length in this page

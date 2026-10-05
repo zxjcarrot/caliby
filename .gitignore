@@ -3,6 +3,7 @@ build/
 cmake-build-*/
 _build/
 
+leanstore/
 examples/perf*
 examples/catalog*
 examples/heapfile

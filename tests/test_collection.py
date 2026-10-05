@@ -26,6 +26,10 @@ def db_path():
 @pytest.fixture
 def initialized_db(db_path):
     """Initialize caliby with a fresh database."""
+    try:
+        caliby.close()  # Close any catalog opened by an earlier module.
+    except Exception:
+        pass
     caliby.open(db_path)
     yield db_path
     try:

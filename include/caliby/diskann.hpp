@@ -177,7 +177,7 @@ class DiskANN : public DiskANNBase {
     };
 
     struct DiskANNMetadataPage {
-        bool dirty;
+        u64 p_gsn = 0;
         PID base_pid;
         uint64_t max_elements;
         std::atomic<uint64_t> node_count;
@@ -186,10 +186,10 @@ class DiskANN : public DiskANNBase {
     };
 
     struct VamanaPage {
-        bool dirty;
+        u64 p_gsn = 0;
         uint16_t node_count_in_page;
         uint16_t padding[3];
-        static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(node_count_in_page) + sizeof(padding);
+        static constexpr size_t HeaderSize = sizeof(p_gsn) + sizeof(node_count_in_page) + sizeof(padding);
         uint8_t* getNodeData() { return reinterpret_cast<uint8_t*>(this) + HeaderSize; }
         const uint8_t* getNodeData() const { return reinterpret_cast<const uint8_t*>(this) + HeaderSize; }
     };

@@ -27,7 +27,7 @@ class TestHNSWRecovery:
         
         # Build and flush initial index
         index1 = caliby_module.HnswIndex(num_points, dim, M=16, 
-                                         ef_construction=200, skip_recovery=True)
+                                         ef_construction=200, skip_recovery=True, name="rec_basic")
         index1.add_items(vectors)
         labels1, distances1 = index1.search_knn(query, k, ef_search=100)
         
@@ -38,7 +38,7 @@ class TestHNSWRecovery:
         
         # Recover and verify
         index2 = caliby_module.HnswIndex(num_points, dim, M=16, 
-                                         ef_construction=200, skip_recovery=False)
+                                         ef_construction=200, skip_recovery=False, name="rec_basic")
         assert index2.was_recovered(), "Index should have been recovered from disk"
         
         labels2, distances2 = index2.search_knn(query, k, ef_search=100)
@@ -57,14 +57,14 @@ class TestHNSWRecovery:
         vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
         
         # Build and flush
-        index1 = caliby_module.HnswIndex(num_points, dim, skip_recovery=True)
+        index1 = caliby_module.HnswIndex(num_points, dim, skip_recovery=True, name="rec_skip")
         index1.add_items(vectors)
         index1.flush()
         caliby_module.flush_storage()
         del index1
         
         # Create with skip_recovery=True (should NOT recover)
-        index2 = caliby_module.HnswIndex(num_points, dim, skip_recovery=True)
+        index2 = caliby_module.HnswIndex(num_points, dim, skip_recovery=True, name="rec_skip")
         assert not index2.was_recovered(), "Index should not recover with skip_recovery=True"
     
     def test_recovery_with_mismatched_params(self, caliby_module, temp_dir):
@@ -76,14 +76,14 @@ class TestHNSWRecovery:
         vectors = np.random.randn(num_points, dim).astype(np.float32)
         
         # Build with M=16
-        index1 = caliby_module.HnswIndex(num_points, dim, M=16, skip_recovery=True)
+        index1 = caliby_module.HnswIndex(num_points, dim, M=16, skip_recovery=True, name="rec_mismatch1")
         index1.add_items(vectors)
         index1.flush()
         caliby_module.flush_storage()
         del index1
         
         # Try to recover with M=32 (different parameter)
-        index2 = caliby_module.HnswIndex(num_points, dim, M=32, skip_recovery=False)
+        index2 = caliby_module.HnswIndex(num_points, dim, M=32, skip_recovery=False, name="rec_mismatch2")
         # Should not recover due to parameter mismatch
         assert not index2.was_recovered(), "Index should not recover with mismatched M parameter"
     
@@ -100,7 +100,7 @@ class TestHNSWRecovery:
         query = vectors[0].copy()
         
         # Initial build
-        index = caliby_module.HnswIndex(num_points, dim, skip_recovery=True)
+        index = caliby_module.HnswIndex(num_points, dim, skip_recovery=True, name="rec_cycles")
         index.add_items(vectors)
         index.flush()
         caliby_module.flush_storage()
@@ -110,7 +110,7 @@ class TestHNSWRecovery:
         
         # Test multiple recovery cycles
         for cycle in range(num_cycles):
-            index = caliby_module.HnswIndex(num_points, dim, skip_recovery=False)
+            index = caliby_module.HnswIndex(num_points, dim, skip_recovery=False, name="rec_cycles")
             
             assert index.was_recovered(), f"Recovery cycle {cycle+1} failed"
             
@@ -140,14 +140,14 @@ class TestHNSWRecovery:
         vectors_batch2 = np.random.randn(num_points_batch2, dim).astype(np.float32)
         
         # Build with first batch
-        index1 = caliby_module.HnswIndex(total_points, dim, skip_recovery=True)
+        index1 = caliby_module.HnswIndex(total_points, dim, skip_recovery=True, name="rec_partial")
         index1.add_items(vectors_batch1)
         index1.flush()
         caliby_module.flush_storage()
         del index1
         
         # Recover and add second batch
-        index2 = caliby_module.HnswIndex(total_points, dim, skip_recovery=False)
+        index2 = caliby_module.HnswIndex(total_points, dim, skip_recovery=False, name="rec_partial")
         assert index2.was_recovered(), "Should recover after partial build"
         
         index2.add_items(vectors_batch2)
@@ -170,7 +170,7 @@ class TestHNSWRecovery:
         vectors = np.random.randn(num_points, dim).astype(np.float32)
         
         # Build index and get stats
-        index1 = caliby_module.HnswIndex(num_points, dim, M=16, skip_recovery=True)
+        index1 = caliby_module.HnswIndex(num_points, dim, M=16, skip_recovery=True, name="rec_graph")
         index1.add_items(vectors)
         stats1 = index1.get_stats()
         index1.flush()
@@ -178,7 +178,7 @@ class TestHNSWRecovery:
         del index1
         
         # Recover and check stats match
-        index2 = caliby_module.HnswIndex(num_points, dim, M=16, skip_recovery=False)
+        index2 = caliby_module.HnswIndex(num_points, dim, M=16, skip_recovery=False, name="rec_graph")
         assert index2.was_recovered()
         stats2 = index2.get_stats()
         

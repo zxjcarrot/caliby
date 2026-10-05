@@ -18,6 +18,27 @@
 
 namespace caliby {
 
+// The IndexCatalog is a singleton that outlives BufferManager restarts
+// (set_buffer_config auto-restarts the system). Resolve the CURRENT global
+// BufferManager on every use instead of caching a pointer.
+void IndexCatalog::ensure_explicit_storage(uint32_t index_id, uint64_t max_elements) {
+    std::unique_lock lock(catalog_mutex_);
+    if (!initialized_.load()) {
+        throw std::runtime_error("Catalog not initialized");
+    }
+    if (index_id == 0 || storage_.get_fd(index_id) >= 0) {
+        return;
+    }
+    std::string filename = storage_.make_index_filename(IndexType::HNSW, index_id, "explicit_" + std::to_string(index_id));
+    int fd = storage_.open_file(index_id, filename, true);
+    if (fd < 0) {
+        throw std::runtime_error("Failed to create explicit index file: " + filename);
+    }
+    if (::bm_ptr) {
+        uint64_t initial_pages = (max_elements == 0) ? 1024 : (max_elements / 2) + 1024;
+        ::bm_ptr->registerIndex(index_id, initial_pages, 0, fd);
+    }
+}
 namespace fs = std::filesystem;
 
 //=============================================================================
@@ -240,7 +261,7 @@ IndexHandle::~IndexHandle() {
 }
 
 BufferManager* IndexHandle::buffer_manager() const {
-    return catalog_ ? catalog_->buffer_manager() : nullptr;
+    return catalog_ ? ::bm_ptr : nullptr;
 }
 
 uint64_t IndexHandle::allocate_page() {
@@ -274,11 +295,15 @@ IndexCatalog::~IndexCatalog() {
     shutdown();
 }
 
-void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist) {
+void IndexCatalog::initialize(const std::string& data_dir_in, bool cleanup_if_exist) {
     std::unique_lock lock(catalog_mutex_);
-    
+    std::string data_dir = fs::absolute(data_dir_in).lexically_normal().string();
     if (initialized_.load()) {
-        return;  // Already initialized
+        if (storage_.data_dir() == data_dir) {
+            return;  // Already initialized to the same directory
+        }
+        throw std::runtime_error("Catalog already initialized to " + storage_.data_dir() +
+                                 "; call shutdown() before opening a different directory");
     }
     
     // Handle cleanup if requested
@@ -338,7 +363,7 @@ void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist
         CALIBY_LOG_INFO("IndexCatalog", "Loaded ", entries_.size(), " index entries from catalog");
         
         // Re-register all loaded indexes with BufferManager
-        if (buffer_manager_) {
+        if (::bm_ptr) {
             size_t recovered = 0;
             for (const auto& entry : entries_) {
                 if (entry.is_active()) {
@@ -358,10 +383,10 @@ void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist
                         } else {
                             initial_pages = (entry.max_elements / 2) + 1024;
                         }
-                        buffer_manager_->registerIndex(entry.index_id, initial_pages, initial_alloc_count, fd);
+                        ::bm_ptr->registerIndex(entry.index_id, initial_pages, initial_alloc_count, fd);
                         recovered++;
-                        
-                        CALIBY_LOG_DEBUG("IndexCatalog", "Recovered index: ", entry.name, 
+
+                        CALIBY_LOG_DEBUG("IndexCatalog", "Recovered index: ", entry.name,
                                         " (id=", entry.index_id, ")");
                     } catch (const std::exception& e) {
                         CALIBY_LOG_WARN("IndexCatalog", "Failed to recover index ", entry.name, 
@@ -388,7 +413,23 @@ void IndexCatalog::initialize(const std::string& data_dir, bool cleanup_if_exist
     if (storage_.get_fd(CATALOG_INDEX_ID) < 0) {
         storage_.open_file(CATALOG_INDEX_ID, "caliby_catalog", false);
     }
-    
+
+    // Open the backing file for the global namespace (index-0 PIDs:
+    // global MetaDataPage + engine BTree pages) and register it so those
+    // pages are flushable/evictable like every other index.
+    int global_fd = storage_.get_fd(GLOBAL_NAMESPACE_STORAGE_ID);
+    if (global_fd < 0) {
+        global_fd = storage_.open_file(GLOBAL_NAMESPACE_STORAGE_ID, "caliby_global", !catalog_exists);
+    }
+    if (::bm_ptr) {
+        ::bm_ptr->setGlobalNamespaceFd(global_fd);
+        if (catalog_exists) {
+            // Recover the persisted global MetaDataPage (PID 0). The buffer
+            // manager ctor pre-allocated it zeroed, which would otherwise wipe
+            // BTree root slots + alloc_count_snapshot on every reopen.
+            ::bm_ptr->reloadGlobalMetadataPage();
+        }
+    }
     initialized_.store(true);
     
     CALIBY_LOG_INFO("IndexCatalog", "Initialized in: ", data_dir);
@@ -593,7 +634,7 @@ IndexHandle IndexCatalog::create_index(const std::string& name, IndexType type,
     
     // Register index with BufferManager's multi-level translation array
     // This allocates a per-index translation array for hole-punching
-    if (buffer_manager_) {
+    if (::bm_ptr) {
         // Initial capacity - array will grow dynamically as needed via mremap()
         // Start with a small capacity; ensureCapacity() will grow it automatically
         // This means collections can truly grow unbounded (limited only by virtual address space)
@@ -605,7 +646,7 @@ IndexHandle IndexCatalog::create_index(const std::string& name, IndexType type,
             // Fixed max_elements - estimate based on that
             initial_pages = (config.max_elements / 2) + 1024;
         }
-        buffer_manager_->registerIndex(index_id, initial_pages, 0, fd);  // 0 = initial alloc count
+        ::bm_ptr->registerIndex(index_id, initial_pages, 0, fd);  // 0 = initial alloc count
     }
     
     // Add to catalog
@@ -619,11 +660,11 @@ IndexHandle IndexCatalog::create_index(const std::string& name, IndexType type,
     // Persist catalog changes
     save_catalog_header();
     save_index_entry(entries_.back());
-    
-    CALIBY_LOG_INFO("IndexCatalog", "Created index: ", name, 
+
+    CALIBY_LOG_INFO("IndexCatalog", "Created index: ", name,
                    " (id=", index_id, ", type=", static_cast<int>(type), ")");
-    
-    return IndexHandle(this, index_id, fd, name, type, 
+
+    return IndexHandle(this, index_id, fd, name, type,
                       config.dimensions, config.max_elements);
 }
 
@@ -711,9 +752,9 @@ IndexHandle IndexCatalog::create_text_index(const std::string& name,
     }
     
     // Register index with BufferManager
-    if (buffer_manager_) {
+    if (::bm_ptr) {
         uint64_t initial_pages = 1024;  // Start small, grows automatically
-        buffer_manager_->registerIndex(index_id, initial_pages, 0, fd);  // 0 = initial alloc count
+        ::bm_ptr->registerIndex(index_id, initial_pages, 0, fd);  // 0 = initial alloc count
     }
     
     // Add to catalog
@@ -790,9 +831,9 @@ IndexHandle IndexCatalog::create_btree_index(const std::string& name,
     }
     
     // Register index with BufferManager
-    if (buffer_manager_) {
+    if (::bm_ptr) {
         uint64_t initial_pages = 1024;  // Start small, grows automatically
-        buffer_manager_->registerIndex(index_id, initial_pages, 0, fd);  // 0 = initial alloc count
+        ::bm_ptr->registerIndex(index_id, initial_pages, 0, fd);  // 0 = initial alloc count
     }
     
     // Add to catalog
@@ -838,8 +879,8 @@ IndexHandle IndexCatalog::open_index(const std::string& name) {
     }
     
     CALIBY_LOG_DEBUG("IndexCatalog", "Opened index: ", name, " (id=", entry->index_id, ")");
-    
-    return IndexHandle(const_cast<IndexCatalog*>(this), entry->index_id, fd, 
+
+    return IndexHandle(const_cast<IndexCatalog*>(this), entry->index_id, fd,
                       name, entry->index_type, entry->dimensions, entry->max_elements);
 }
 
@@ -870,9 +911,9 @@ void IndexCatalog::drop_index(const std::string& name) {
     
     // Unregister index from BufferManager's multi-level translation array
     // This frees the per-index translation array
-    if (buffer_manager_) {
+    if (::bm_ptr) {
         try {
-            buffer_manager_->unregisterIndex(index_id);
+            ::bm_ptr->unregisterIndex(index_id);
         } catch (const std::exception& e) {
             // Log but don't throw - the index may not have been registered in Array2Level mode
             CALIBY_LOG_DEBUG("IndexCatalog", "Could not unregister index from buffer manager: ", e.what());
@@ -1110,8 +1151,8 @@ void IndexCatalog::update_collection_config(const std::string& name, const Colle
 
 void IndexCatalog::update_text_config(const std::string& name, const TextTypeMetadata& config) {
     std::unique_lock lock(catalog_mutex_);
-    
-    CALIBY_LOG_DEBUG("IndexCatalog", "update_text_config for '", name, 
+
+    CALIBY_LOG_DEBUG("IndexCatalog", "update_text_config for '", name,
                      "': btree_slot=", config.btree_slot_id,
                      ", vocab=", config.vocab_size,
                      ", docs=", config.doc_count);
@@ -1161,8 +1202,8 @@ void IndexCatalog::update_index_alloc_pages(uint32_t index_id, uint64_t alloc_pa
         entry->alloc_pages = alloc_pages;
         entry->modify_time = static_cast<uint64_t>(std::time(nullptr));
         save_index_entry(*entry);
-        
-        CALIBY_LOG_DEBUG("IndexCatalog", "Updated alloc_pages for index ", index_id, 
+
+        CALIBY_LOG_DEBUG("IndexCatalog", "Updated alloc_pages for index ", index_id,
                          " to ", alloc_pages);
     }
 }

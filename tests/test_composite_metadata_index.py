@@ -31,6 +31,10 @@ def temp_dir():
 def initialized_db(temp_dir):
     """Initialize Caliby database."""
     db_path = os.path.join(temp_dir, "test.db")
+    try:
+        caliby.close()  # Close any catalog opened by an earlier module.
+    except Exception:
+        pass
     caliby.open(db_path)
     yield db_path
     try:

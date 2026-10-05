@@ -247,7 +247,7 @@ class TestHNSWRecovery:
         query = vectors[0].copy()
         
         index1 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, M=16, 
-                                         ef_construction=200, skip_recovery=True)
+                                         ef_construction=200, skip_recovery=True, name="hnsw_rec1")
         index1.add_points(vectors)
         labels1, distances1 = index1.search_knn(query, k, ef_search=100)
         
@@ -258,7 +258,7 @@ class TestHNSWRecovery:
         
         # Recover and verify
         index2 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, M=16, 
-                                         ef_construction=200, skip_recovery=False)
+                                         ef_construction=200, skip_recovery=False, name="hnsw_rec1")
         assert index2.was_recovered()
         
         labels2, distances2 = index2.search_knn(query, k, ef_search=100)
@@ -275,14 +275,14 @@ class TestHNSWRecovery:
         vectors = np.random.randn(num_points, dim).astype(np.float32)
         
         # Build and flush
-        index1 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, skip_recovery=True)
+        index1 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, skip_recovery=True, name="hnsw_rec2")
         index1.add_points(vectors)
         index1.flush()
         caliby_module.flush_storage()
         del index1
         
         # Create with skip_recovery=True (should NOT recover)
-        index2 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, skip_recovery=True)
+        index2 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, skip_recovery=True, name="hnsw_rec2")
         assert not index2.was_recovered()
     
     def test_recovery_with_different_params(self, caliby_module, temp_dir):
@@ -293,14 +293,14 @@ class TestHNSWRecovery:
         vectors = np.random.randn(num_points, dim).astype(np.float32)
         
         # Build with M=16
-        index1 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, M=16, skip_recovery=True)
+        index1 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, M=16, skip_recovery=True, name="hnsw_rec3")
         index1.add_points(vectors)
         index1.flush()
         caliby_module.flush_storage()
         del index1
         
         # Try to recover with M=32 (different parameter)
-        index2 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, M=32, skip_recovery=False)
+        index2 = caliby_module.HnswIndex(max_elements=num_points, dim=dim, M=32, skip_recovery=False, name="hnsw_rec4")
         # Should not recover due to parameter mismatch
         assert not index2.was_recovered()
 

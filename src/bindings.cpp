@@ -108,7 +108,7 @@ using HnswIndexType = HNSW<hnsw_distance::SIMDAcceleratedL2>;
 PYBIND11_MODULE(caliby, m) {
     m.doc() = "Python bindings for the Calico Index(B-Tree, HNSW)";
     m.attr("__version__") = "0.1.2";
-    
+
     // Register cleanup function to be called at module unload
     auto cleanup = []() {
         CALIBY_LOG_INFO("Bindings", "Calico module unloading: Shutting down system...");
@@ -136,22 +136,22 @@ PYBIND11_MODULE(caliby, m) {
     //          "Initializes a new, empty HNSW index with runtime parameters.")
     m.def("flush_storage", []() { flush_system(); },
           "Flushes all dirty pages managed by the Calico buffer pool to persistent storage.");
-    
+
     m.def("open", [](const std::string& data_dir, bool cleanup_if_exist) {
         // Reset system closed flag - system is being (re)opened
         system_closed = false;
-        
+
         // Store data directory for later use
         set_data_directory(data_dir);
-        
+
         // Initialize the buffer manager and catalog with the specified directory
         initialize_system();
-        
+
         // Set the path for the simple IndexCatalog (stores in data directory)
         if (bm_ptr && bm_ptr->indexCatalog) {
             std::string simple_catalog_path = data_dir + "/caliby_simple_catalog.dat";
             bm_ptr->indexCatalog->setPath(simple_catalog_path);
-            
+
             if (cleanup_if_exist) {
                 // Clear entries and don't load old data
                 bm_ptr->indexCatalog->clear();
@@ -160,10 +160,9 @@ PYBIND11_MODULE(caliby, m) {
                 bm_ptr->indexCatalog->load();
             }
         }
-        
+
         // Connect catalog to buffer manager for proper index registration
         // Use &bm to get address of the BufferManager (bm is defined as *bm_ptr)
-        caliby::IndexCatalog::instance().setBufferManager(&bm);
         caliby::IndexCatalog::instance().initialize(data_dir, cleanup_if_exist);
     }, py::arg("data_dir"), py::arg("cleanup_if_exist") = false,
     "Open caliby with a specific data directory for storing index files and catalog. "
@@ -173,24 +172,24 @@ PYBIND11_MODULE(caliby, m) {
     "\n\nParameters:\n"
     "  data_dir: Path to the data directory\n"
     "  cleanup_if_exist: If True, removes all existing indexes and data in the directory (default: False)");
-    
+
     m.def("close", []() {
         // Mark system as closed BEFORE unregistering index arrays
         // This prevents Collection destructors from trying to flush after close
         system_closed = true;
-        
+
         // Flush all changes
         flush_system();
-        
+
         // Persist index translation array capacities before shutdown
         // This ensures proper recovery of array sizes on restart
         if (bm_ptr != nullptr) {
             bm_ptr->persistIndexCapacities();
         }
-        
+
         // Shutdown catalog
         caliby::IndexCatalog::instance().shutdown();
-        
+
         // Unregister all non-zero indexes from the BufferManager
         // This allows open() to be called again with fresh state
         if (bm_ptr != nullptr) {
@@ -199,11 +198,15 @@ PYBIND11_MODULE(caliby, m) {
     },
     "Close caliby, flushing all changes and releasing the data directory lock. "
     "Should be called before program exit for clean shutdown.");
-    
+
     m.def("set_buffer_config", [](float size_gb, float virtgb) {
         if (bm_ptr != nullptr) {
-            throw std::runtime_error("Cannot change buffer config after system is initialized. "
-                                     "Call set_buffer_config() before creating any indexes.");
+            // Auto-restart: flush + destroy the live system so the new config applies.
+            // Callers pair this with open() immediately after, so this becomes fresh boot with new sizing.
+            CALIBY_LOG_WARN("Bindings", "set_buffer_config called on initialized system; restarting it");
+            shutdown_system();
+            caliby::IndexCatalog::instance().shutdown();
+            system_closed = true;
         }
         set_buffer_config(virtgb, size_gb);
     }, py::arg("size_gb"), py::arg("virtgb") = 4.0f,
@@ -212,7 +215,7 @@ PYBIND11_MODULE(caliby, m) {
     "size_gb: physical buffer size in GB (default: 1.0), "
     "virtgb: virtual buffer size in GB (default: 4.0). "
     "If not called, reasonable defaults (1GB physical, 4GB virtual) are used.");
-    
+
     // --- Logging Configuration ---
     py::enum_<caliby::LogLevel>(m, "LogLevel")
         .value("DEBUG", caliby::LogLevel::DEBUG)
@@ -221,23 +224,23 @@ PYBIND11_MODULE(caliby, m) {
         .value("ERROR", caliby::LogLevel::ERROR)
         .value("OFF", caliby::LogLevel::OFF)
         .export_values();
-    
+
     m.def("set_log_level", [](caliby::LogLevel level) {
         caliby::set_log_level(level);
     }, py::arg("level"),
     "Set the logging level using LogLevel enum. "
     "Levels: DEBUG (verbose), INFO (normal), WARN (warnings only), ERROR (errors only), OFF (silent).");
-    
+
     m.def("set_log_level", [](const std::string& level) {
         caliby::set_log_level(caliby::string_to_log_level(level));
     }, py::arg("level"),
     "Set the logging level using a string. "
     "Valid values: 'DEBUG', 'INFO', 'WARN', 'ERROR', 'OFF' (case-insensitive).");
-    
+
     m.def("get_log_level", []() {
         return caliby::get_log_level();
     }, "Get the current logging level.");
-    
+
     m.def("force_evict_buffer_portion", [](float portion) {
         if (bm_ptr) {
             bm_ptr->forceEvictPortion(portion);
@@ -254,29 +257,60 @@ PYBIND11_MODULE(caliby, m) {
                                 const std::string& name) {
                     // Ensure system is initialized before creating index
                     initialize_system();
-                    
+                    // Lazy-bootstrap the catalog for standalone usage
+                    caliby::IndexCatalog& catalog = caliby::IndexCatalog::instance();
+                    if (!catalog.is_initialized()) {
+                        const char* dir_env = getenv("CALIBY_DATA_DIR");
+                        std::string dir = dir_env ? dir_env : "./caliby_data";
+                        std::filesystem::create_directories(dir);
+                        set_data_directory(dir);
+                        catalog.initialize(dir);
+                    }
                     uint32_t final_index_id = index_id;
                     std::string final_name = name;
-                    
+
                     // If index_id is 0 and catalog is initialized, create a catalog entry
-                    caliby::IndexCatalog& catalog = caliby::IndexCatalog::instance();
                     if (final_index_id == 0 && catalog.is_initialized()) {
-                        // Generate a name if not provided
+                        // Un-named indexes get a stable name for recovery
                         if (final_name.empty()) {
-                            final_name = "hnsw_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                            final_name = "default_hnsw";
                         }
-                        
-                        // Create catalog entry which sets up per-index file
-                        caliby::IndexHandle handle = catalog.create_hnsw_index(
-                            final_name, 
-                            static_cast<uint32_t>(dim),
-                            max_elements,
-                            M,
-                            ef_construction
-                        );
-                        final_index_id = handle.index_id();
+                        const bool auto_named = name.empty();
+                        if (catalog.index_exists(final_name)) {
+                            // Reopen when every parameter matches.
+                            caliby::HNSWConfig cfg = catalog.get_hnsw_config(final_name);
+                            caliby::IndexInfo info = catalog.get_index_info(final_name);
+                            bool reuse = info.dimensions == static_cast<uint32_t>(dim) &&
+                                         info.max_elements == max_elements &&
+                                         cfg.M == static_cast<uint32_t>(M) &&
+                                         cfg.ef_construction == static_cast<uint32_t>(ef_construction);
+                            if (!reuse && auto_named) {
+                                final_name = "hnsw_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                            } else if (!reuse) {
+                                throw std::runtime_error(
+                                    "Index already exists: " + final_name +
+                                    " (with different parameters)");
+                            } else {
+                                final_index_id = catalog.open_index(final_name).index_id();
+                            }
+                        }
+                        if (final_index_id == 0) {
+                            // Create catalog entry which sets up per-index file.
+                            final_index_id = catalog.create_hnsw_index(
+                                final_name,
+                                static_cast<uint32_t>(dim),
+                                max_elements,
+                                M,
+                                ef_construction
+                            ).index_id();
+                        }
                     }
-                    
+
+                    // Explicitly-addressed index ids (direct multi-index API)
+                    // still need per-index backing storage.
+                    if (final_index_id != 0) {
+                        catalog.ensure_explicit_storage(final_index_id, max_elements);
+                    }
                     return new HnswIndexType(max_elements, dim, M, ef_construction,
                                            enable_prefetch, skip_recovery, final_index_id, final_name);
                 }),
@@ -444,14 +478,14 @@ num_threads : int, optional
         A 2D NumPy array of shape (num_queries, dim) containing the query vectors.
     k : int
         The number of nearest neighbors to search for.
-    
+
     ef_search_param: int
         The ef_search num.
 
     num_threads : int, optional
         The number of threads to use for the search. If 0, it defaults to the
         number of hardware cores. (default: 0).
-    
+
     stats: bool, optional
 
     Returns:
@@ -583,20 +617,20 @@ num_threads : int, optional
                          const std::string& name) {
                  // Ensure system is initialized before creating index
                  initialize_system();
-                 
+
                  uint32_t index_id = 0;
-                 
+
                  // Check if catalog is initialized - if so, create an index entry
                  caliby::IndexCatalog& catalog = caliby::IndexCatalog::instance();
                  if (catalog.is_initialized()) {
                      // Generate a name if not provided
-                     std::string idx_name = name.empty() 
+                     std::string idx_name = name.empty()
                          ? "diskann_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
                          : name;
-                     
+
                      // Create catalog entry which sets up per-index file
                      caliby::IndexHandle handle = catalog.create_diskann_index(
-                         idx_name, 
+                         idx_name,
                          static_cast<uint32_t>(dimensions),
                          max_elements,
                          static_cast<uint32_t>(R_max_degree),
@@ -605,7 +639,7 @@ num_threads : int, optional
                      );
                      index_id = handle.index_id();
                  }
-                 
+
                  // Pass the index_id to the factory function.
                  return create_index(dimensions, max_elements, R_max_degree, is_dynamic, index_id);
              }),
@@ -785,7 +819,7 @@ num_threads : int, optional
     // =========================================================================================
     // IVF+PQ Index Bindings
     // =========================================================================================
-    
+
     using IVFPQIndexType = IVFPQ<L2Distance>;
 
     py::class_<IVFPQStats>(m, "IVFPQStats")
@@ -807,6 +841,19 @@ num_threads : int, optional
                         const std::string& name) {
             // Ensure system is initialized before creating index
             initialize_system();
+            // Standalone usage (no caliby.open()) still needs the catalog and
+            // explicit ids need backing storage, mirroring HnswIndex.
+            caliby::IndexCatalog& catalog = caliby::IndexCatalog::instance();
+            if (!catalog.is_initialized()) {
+                const char* dir_env = getenv("CALIBY_DATA_DIR");
+                std::string dir = dir_env ? dir_env : "./caliby_data";
+                std::filesystem::create_directories(dir);
+                set_data_directory(dir);
+                catalog.initialize(dir);
+            }
+            if (index_id != 0) {
+                catalog.ensure_explicit_storage(index_id, max_elements);
+            }
             return new IVFPQIndexType(max_elements, dim, num_clusters, num_subquantizers,
                                       retrain_interval, skip_recovery, index_id, name);
         }),
@@ -820,7 +867,7 @@ num_threads : int, optional
              py::arg("name") = "",
              R"doc(
     Initializes a new IVF+PQ index with runtime parameters.
-    
+
     Parameters:
     -----------
     max_elements : int
@@ -844,20 +891,20 @@ num_threads : int, optional
         .def("flush", [](IVFPQIndexType& self) {
             self.flush();
         }, "Flushes all dirty pages to persistent storage.")
-        
+
         .def("get_name", &IVFPQIndexType::getName,
              "Returns the name of the index.")
-        
+
         .def("get_dim", &IVFPQIndexType::getDim,
              "Returns the dimensionality of vectors managed by the index.")
-        
+
         .def("get_count", [](IVFPQIndexType& self) { return self.size(); },
              "Returns the current number of vectors in the index.")
-        
+
         .def("is_trained", &IVFPQIndexType::isTrained,
              "Returns True if the index has been trained with initial centroids.")
-        
-        .def("train", [](IVFPQIndexType& self, 
+
+        .def("train", [](IVFPQIndexType& self,
                         py::array_t<float, py::array::c_style | py::array::forcecast> training_data) {
             if (training_data.ndim() != 2) {
                 throw std::runtime_error("Training data must be 2-dimensional (n_samples, dim)");
@@ -874,7 +921,7 @@ num_threads : int, optional
         R"doc(
     Trains the IVF centroids and PQ codebooks using the provided training data.
     Must be called before adding points if the index is not recovered from storage.
-    
+
     Parameters:
     -----------
     training_data : numpy.ndarray
@@ -896,7 +943,7 @@ num_threads : int, optional
             if (!self.isTrained()) {
                 throw std::runtime_error("Index must be trained before adding points. Call train() first.");
             }
-            
+
             size_t n_items = items.shape(0);
             // Generate sequential IDs starting from current size
             std::vector<u32> ids(n_items);
@@ -904,13 +951,13 @@ num_threads : int, optional
             for (size_t i = 0; i < n_items; ++i) {
                 ids[i] = static_cast<u32>(start_id + i);
             }
-            
+
             self.addPoints(items.data(), ids.data(), n_items, num_threads == 0 ? 1 : num_threads);
         },
         py::arg("items"), py::arg("num_threads") = 0,
         R"doc(
     Adds a batch of points from a NumPy array to the index in parallel.
-    
+
     Parameters:
     -----------
     items : numpy.ndarray
@@ -930,7 +977,7 @@ num_threads : int, optional
                 throw std::runtime_error("Query vector has incorrect dimension. Expected " +
                                         std::to_string(dim) + ", but got " + std::to_string(query.shape(0)));
             }
-            
+
             const float* query_ptr = query.data();
             std::vector<std::pair<float, u32>> result_vec;
             if (stats) {
@@ -938,20 +985,20 @@ num_threads : int, optional
             } else {
                 result_vec = self.search<false>(query_ptr, k, nprobe);
             }
-            
+
             py::list labels;
             py::list distances;
             for (const auto& pair : result_vec) {
                 distances.append(pair.first);
                 labels.append(pair.second);
             }
-            
+
             return py::make_tuple(py::array(labels), py::array(distances));
         },
         py::arg("query"), py::arg("k"), py::arg("nprobe"), py::arg("stats") = false,
         R"doc(
     Searches for the k-nearest neighbors for a given query vector.
-    
+
     Parameters:
     -----------
     query : numpy.ndarray
@@ -962,7 +1009,7 @@ num_threads : int, optional
         The number of clusters to probe during search (higher = more accurate but slower).
     stats : bool, optional
         If True, update statistics counters (default: False).
-    
+
     Returns:
     --------
     tuple[numpy.ndarray, numpy.ndarray]
@@ -984,7 +1031,7 @@ num_threads : int, optional
             if (k == 0) {
                 throw std::runtime_error("k must be > 0");
             }
-            
+
             size_t num_queries = queries.shape(0);
             if (num_queries == 0) {
                 std::vector<ssize_t> shape = {0, static_cast<ssize_t>(k)};
@@ -992,7 +1039,7 @@ num_threads : int, optional
                 py::array_t<float> empty_distances(shape);
                 return py::make_tuple(empty_labels, empty_distances);
             }
-            
+
             std::span<const float> query_span(queries.data(), queries.size());
             std::vector<std::vector<std::pair<float, u32>>> all_results_vec;
             if (stats) {
@@ -1000,14 +1047,14 @@ num_threads : int, optional
             } else {
                 all_results_vec = self.searchBatch<false>(query_span, k, nprobe, num_threads);
             }
-            
+
             std::vector<ssize_t> result_shape = {static_cast<ssize_t>(num_queries), static_cast<ssize_t>(k)};
             py::array_t<int64_t> labels_arr(result_shape);
             py::array_t<float> distances_arr(result_shape);
-            
+
             auto labels_ptr = labels_arr.mutable_data();
             auto distances_ptr = distances_arr.mutable_data();
-            
+
             for (size_t i = 0; i < num_queries; ++i) {
                 const auto& results_for_one_query = all_results_vec[i];
                 for (size_t j = 0; j < k; ++j) {
@@ -1020,14 +1067,14 @@ num_threads : int, optional
                     }
                 }
             }
-            
+
             return py::make_tuple(labels_arr, distances_arr);
         },
         py::arg("queries"), py::arg("k"), py::arg("nprobe"), py::arg("num_threads") = 0,
         py::arg("stats") = false,
         R"doc(
     Searches for the k-nearest neighbors for a batch of query vectors in parallel.
-    
+
     Parameters:
     -----------
     queries : numpy.ndarray
@@ -1040,7 +1087,7 @@ num_threads : int, optional
         The number of threads to use for searching. If 0, defaults to hardware cores (default: 0).
     stats : bool, optional
         If True, update statistics counters (default: False).
-    
+
     Returns:
     --------
     tuple[numpy.ndarray, numpy.ndarray]
@@ -1063,7 +1110,7 @@ num_threads : int, optional
         },
         R"doc(
     Returns a dictionary containing performance and index statistics.
-    
+
     Returns:
     --------
     dict:
@@ -1079,7 +1126,7 @@ num_threads : int, optional
 
         .def("reset_stats", &IVFPQIndexType::resetStats,
              "Resets live statistics counters.")
-        
+
         .def("get_stats_string", [](IVFPQIndexType& self) {
             return self.getStats().toString();
         }, "Returns a formatted string of current statistics.");
@@ -1139,7 +1186,7 @@ num_threads : int, optional
         .def_readonly("modify_time", &caliby::IndexInfo::modify_time)
         .def_readonly("file_path", &caliby::IndexInfo::file_path)
         .def("__repr__", [](const caliby::IndexInfo& info) {
-            return "<IndexInfo name='" + info.name + "' type=" + 
+            return "<IndexInfo name='" + info.name + "' type=" +
                    std::to_string(static_cast<int>(info.type)) +
                    " elements=" + std::to_string(info.num_elements) + ">";
         });
@@ -1154,7 +1201,7 @@ num_threads : int, optional
         .def("flush", &caliby::IndexHandle::flush)
         .def("global_page_id", &caliby::IndexHandle::global_page_id)
         .def("__repr__", [](const caliby::IndexHandle& h) {
-            return "<IndexHandle name='" + h.name() + "' id=" + 
+            return "<IndexHandle name='" + h.name() + "' id=" +
                    std::to_string(h.index_id()) + ">";
         });
 
@@ -1321,7 +1368,7 @@ num_threads : int, optional
         });
 
     py::class_<caliby::Collection>(m, "Collection")
-        .def(py::init([](const std::string& name, const caliby::Schema& schema, 
+        .def(py::init([](const std::string& name, const caliby::Schema& schema,
                          uint32_t vector_dim, caliby::DistanceMetric distance_metric) {
             // Ensure system is initialized
             initialize_system();
@@ -1329,19 +1376,19 @@ num_threads : int, optional
         }), py::arg("name"), py::arg("schema"), py::arg("vector_dim") = 0,
            py::arg("distance_metric") = caliby::DistanceMetric::COSINE,
         "Create a new collection with the given name and schema.")
-        
+
         .def_static("open", &caliby::Collection::open, py::arg("name"),
              "Open an existing collection by name.")
-        
+
         .def("name", &caliby::Collection::name, "Get the collection name.")
         .def("schema", &caliby::Collection::schema, py::return_value_policy::reference,
              "Get the collection schema.")
         .def("doc_count", &caliby::Collection::doc_count, "Get the number of documents.")
         .def("vector_dim", &caliby::Collection::vector_dim, "Get vector dimensions.")
         .def("has_vectors", &caliby::Collection::has_vectors, "Check if collection supports vectors.")
-        
+
         // Document operations (batch-oriented API)
-        .def("add", [](caliby::Collection& self, 
+        .def("add", [](caliby::Collection& self,
                        const std::vector<std::string>& contents,
                        const py::list& metadatas,
                        const std::vector<std::vector<float>>& vectors) {
@@ -1355,10 +1402,10 @@ num_threads : int, optional
         }, py::arg("contents"), py::arg("metadatas"),
            py::arg("vectors") = std::vector<std::vector<float>>{},
         "Add documents to the collection. Returns assigned document IDs.")
-        
+
         .def("get", py::overload_cast<const std::vector<uint64_t>&>(&caliby::Collection::get),
              py::arg("ids"), "Get documents by IDs.")
-        
+
         .def("update", [](caliby::Collection& self,
                           const std::vector<uint64_t>& ids,
                           const py::list& metadatas) {
@@ -1371,24 +1418,24 @@ num_threads : int, optional
             self.update(ids, metas);
         }, py::arg("ids"), py::arg("metadatas"),
         "Update document metadata.")
-        
+
         .def("delete", py::overload_cast<const std::vector<uint64_t>&>(&caliby::Collection::delete_docs),
              py::arg("ids"), "Delete documents by IDs.")
-        
+
         // Index creation
         .def("create_hnsw_index", &caliby::Collection::create_hnsw_index,
              py::arg("name"), py::arg("M") = 16, py::arg("ef_construction") = 200,
              "Create an HNSW index for vector search.")
-        
+
         .def("create_diskann_index", &caliby::Collection::create_diskann_index,
              py::arg("name"), py::arg("R") = 64, py::arg("L") = 100, py::arg("alpha") = 1.2f,
              "Create a DiskANN index for vector search.")
-        
+
         .def("create_text_index", [](caliby::Collection& self, const std::string& name) {
             self.create_text_index(name, caliby::TextIndexConfig{});
         }, py::arg("name"),
         "Create a text index with BM25 scoring.")
-        
+
         // New API: create_metadata_index with support for composite indices
         .def("create_metadata_index", [](caliby::Collection& self, const std::string& name,
                                           const std::vector<std::string>& fields, bool unique) {
@@ -1407,7 +1454,7 @@ Args:
 Examples:
     # Single-field index
     collection.create_metadata_index("year_idx", ["year"])
-    
+
     # Composite index - can efficiently query:
     #   - category = 'tech'
     #   - category = 'tech' AND year = 2024
@@ -1415,7 +1462,7 @@ Examples:
     #   - year = 2024 (leftmost field missing)
     collection.create_metadata_index("category_year_idx", ["category", "year"])
 )doc")
-        
+
         // Legacy API: create_btree_index (single field only, for backward compatibility)
         .def("create_btree_index", [](caliby::Collection& self, const std::string& name,
                                        const std::string& field, bool unique) {
@@ -1423,7 +1470,7 @@ Examples:
             self.create_metadata_index(name, config);
         }, py::arg("name"), py::arg("field"), py::arg("unique") = false,
         "Create a B-tree index on a metadata field. (Legacy API - use create_metadata_index instead)")
-        
+
         // Array index for fast $contains queries
         .def("create_array_index", &caliby::Collection::create_array_index,
              py::arg("name"), py::arg("field"),
@@ -1440,11 +1487,11 @@ Example:
     schema.add_field("tags", caliby.FieldType.STRING_ARRAY)
     col = caliby.Collection("docs", schema)
     col.create_array_index("tags_idx", "tags")
-    
+
     # Now this filter is fast:
     results = col.search_vector(query, "vec", 10, filter='{"tags": {"$contains": "python"}}')
 )doc")
-        
+
         .def("list_indices", [](caliby::Collection& self) {
             py::list result;
             py::module_ json_module = py::module_::import("json");
@@ -1460,10 +1507,10 @@ Example:
             }
             return result;
         }, "List all indices in the collection.")
-        
+
         .def("drop_index", &caliby::Collection::drop_index, py::arg("name"),
              "Drop an index by name.")
-        
+
         // Search operations
         .def("search_vector", [](caliby::Collection& self,
                                   py::array_t<float, py::array::c_style | py::array::forcecast> query,
@@ -1483,7 +1530,7 @@ Example:
             return self.search_vector(q, index_name, k, filter, params);
         }, py::arg("query"), py::arg("index_name"), py::arg("k"), py::arg("filter") = "", py::arg("ef_search") = 100,
         "Search for similar vectors. Optional filter as JSON string. ef_search controls search accuracy.")
-        
+
         .def("search_text", [](caliby::Collection& self,
                                const std::string& query,
                                const std::string& index_name,
@@ -1496,7 +1543,7 @@ Example:
             return self.search_text(query, index_name, k, filter);
         }, py::arg("query"), py::arg("index_name"), py::arg("k"), py::arg("filter") = "",
         "Search text using BM25 scoring. Optional filter as JSON string.")
-        
+
         .def("search_hybrid", [](caliby::Collection& self,
                                   py::array_t<float, py::array::c_style | py::array::forcecast> query_vec,
                                   const std::string& vector_index,
@@ -1516,13 +1563,13 @@ Example:
            py::arg("k"), py::arg("fusion") = caliby::FusionParams{},
            py::arg("filter") = "",
         "Perform hybrid vector + text search with score fusion.")
-        
+
         .def("flush", &caliby::Collection::flush, "Flush all changes to storage.");
 
     // FilterCondition helper for building filters in Python
     m.def("make_filter", [](const std::string& json) {
         return caliby::FilterCondition::from_json(nlohmann::json::parse(json));
-    }, py::arg("json"), 
+    }, py::arg("json"),
     R"doc(
 Create a filter condition from a JSON string.
 

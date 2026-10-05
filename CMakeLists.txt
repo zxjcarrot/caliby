@@ -16,6 +16,7 @@ option(CALIBY_BUILD_TESTS "Build tests" OFF)
 option(CALIBY_BUILD_BENCHMARKS "Build benchmarks" OFF)
 option(CALIBY_BUILD_PYTHON "Build Python bindings" ON)
 option(CALIBY_USE_OPENMP "Use OpenMP for parallelization" ON)
+option(CALIBY_ENABLE_WAL "Enable write-ahead logging, checkpointing, and recovery" ON)
 
 # Compiler flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -fPIC")
@@ -65,6 +66,7 @@ set(ABSL_LIBS
 # Source files for the core library
 set(CALIBY_SOURCES
     src/calico.cpp
+    src/transaction.cpp
     src/hnsw.cpp
     src/diskann.cpp
     src/distance_diskann.cpp
@@ -76,13 +78,28 @@ set(CALIBY_SOURCES
     src/array_index.cpp
 )
 
+# WAL / checkpointing / recovery (Phase 1-6)
+if(CALIBY_ENABLE_WAL)
+    list(APPEND CALIBY_SOURCES
+        src/recovery/log_io_segment.cpp
+        src/recovery/wal_block_manager.cpp
+        src/recovery/log_buffer.cpp
+        src/recovery/log_worker.cpp
+        src/recovery/log_manager.cpp
+        src/recovery/checkpoint.cpp
+        src/recovery/recovery_backend.cpp
+        src/recovery/recovery_manager.cpp
+    )
+    add_definitions(-DCALIBY_ENABLE_WAL=1)
+endif()
+
 # Create static library
 add_library(caliby_static STATIC ${CALIBY_SOURCES})
 target_include_directories(caliby_static PUBLIC
     ${CMAKE_SOURCE_DIR}/include/caliby
     ${CMAKE_SOURCE_DIR}/third_party
 )
-target_link_libraries(caliby_static 
+target_link_libraries(caliby_static
     PUBLIC Threads::Threads
     PRIVATE ${AIO_LIBRARY}
     PRIVATE ${ABSL_LIBS}
@@ -104,7 +121,7 @@ if(NOT CALIBY_BUILD_PYTHON)
         ${CMAKE_SOURCE_DIR}/include/caliby
         ${CMAKE_SOURCE_DIR}/third_party
     )
-    target_link_libraries(libcaliby 
+    target_link_libraries(libcaliby
         PUBLIC Threads::Threads
         PRIVATE ${AIO_LIBRARY}
         PRIVATE ${ABSL_LIBS}
@@ -152,7 +169,7 @@ if(CALIBY_BUILD_PYTHON)
         ${CMAKE_SOURCE_DIR}/include/caliby
         ${CMAKE_SOURCE_DIR}/third_party
     )
-    target_link_libraries(caliby PRIVATE 
+    target_link_libraries(caliby PRIVATE
         Threads::Threads
         ${AIO_LIBRARY}
         ${ABSL_LIBS}

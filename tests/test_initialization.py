@@ -18,7 +18,7 @@ workspace_root = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, workspace_root)
 
 # Also set build_path for subprocess scripts
-build_path = workspace_root
+build_path = os.path.join(workspace_root, 'build')
 
 
 class TestInitialization:

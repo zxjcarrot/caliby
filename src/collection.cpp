@@ -1918,6 +1918,8 @@ std::vector<SearchResult> Collection::search_vector(
                     size_t next_k = static_cast<size_t>(current_k * postfilter_growth_factor);
                     if (next_k <= current_k) next_k = current_k + 1;
                     current_k = std::min(postfilter_max_k, next_k);
+                    // Searched with the max k already: stop instead of looping forever.
+                    if (current_k >= postfilter_max_k) break;
                 }
             }
         } else {
@@ -2379,7 +2381,7 @@ void Collection::write_document(const Document& doc) {
             header->slot_count++;
             header->free_space -= static_cast<uint16_t>(space_needed);
             header->free_offset = record_offset;
-            header->dirty = true;
+            markPageDirty(header);
             
             // Update ID index
             id_index_insert(doc.id, target_page, slot_num);
@@ -2394,7 +2396,7 @@ void Collection::write_document(const Document& doc) {
     
     // Initialize page header
     auto* header = reinterpret_cast<DocumentPageHeader*>(new_page.ptr);
-    header->dirty = true;
+    markPageDirty(header);
     header->flags = 0;
     header->slot_count = 0;
     header->free_space = static_cast<uint16_t>(pageSize - page_header_size);
@@ -2407,7 +2409,7 @@ void Collection::write_document(const Document& doc) {
         GuardX<Page> prev_page(doc_pages_tail_);
         auto* prev_header = reinterpret_cast<DocumentPageHeader*>(prev_page.ptr);
         prev_header->next_page = target_page;
-        prev_header->dirty = true;
+        markPageDirty(prev_header);
     }
     
     // Update chain pointers
@@ -2454,7 +2456,7 @@ void Collection::write_document(const Document& doc) {
             *prev_overflow_ptr = overflow_page.pid;
             
             auto* overflow_header = reinterpret_cast<OverflowPageHeader*>(overflow_page.ptr);
-            overflow_header->dirty = true;
+            markPageDirty(overflow_header);
             overflow_header->parent_doc_id = doc.id;
             overflow_header->next_overflow = 0;
             
@@ -2632,7 +2634,7 @@ void Collection::delete_document_internal(uint64_t doc_id) {
             auto* slots = reinterpret_cast<SlotEntry*>(
                 reinterpret_cast<uint8_t*>(page.ptr) + page_header_size);
             slots[slot_num].flags |= SlotEntry::FLAG_DELETED;
-            page_header->dirty = true;
+            markPageDirty(page_header);
             
             // Reclaim space (add back to free_space for potential reuse)
             page_header->free_space += slots[slot_num].length + sizeof(SlotEntry);

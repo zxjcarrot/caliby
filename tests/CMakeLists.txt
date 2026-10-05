@@ -1,0 +1,22 @@
+if(CALIBY_BUILD_TESTS)
+    enable_testing()
+    find_package(GTest REQUIRED)
+
+    function(CALIBY_ADD_TEST TEST_NAME)
+        add_executable(${ARGV})
+        target_link_libraries(${TEST_NAME} PUBLIC caliby_static GTest::gtest GTest::gtest_main pthread)
+        target_include_directories(${TEST_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/include/caliby)
+        gtest_discover_tests(${TEST_NAME})
+    endfunction()
+
+    # Phase 1 tests
+    if(CALIBY_ENABLE_WAL)
+        CALIBY_ADD_TEST(TestWALBlock recovery/test_wal_block.cc)
+        CALIBY_ADD_TEST(TestLogEntry recovery/test_log_entry.cc)
+        CALIBY_ADD_TEST(TestLogBuffer recovery/test_log_buffer.cc)
+        CALIBY_ADD_TEST(TestCheckpointer recovery/test_checkpoint.cc)
+        CALIBY_ADD_TEST(TestRecovery recovery/test_recovery.cc)
+        CALIBY_ADD_TEST(TestTransaction recovery/test_transaction.cc)
+        CALIBY_ADD_TEST(TestGsnDirty recovery/test_gsn_dirty.cc)
+    endif()
+endif()

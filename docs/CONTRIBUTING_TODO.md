@@ -16,8 +16,8 @@ This document outlines features and improvements that are open for contribution.
 
 ### 1. Update/Delete Support for Vector Indexes
 
-**Status**: Not Implemented  
-**Complexity**: High  
+**Status**: Not Implemented
+**Complexity**: High
 **Files**: `src/hnsw.cpp`, `src/diskann.cpp`, `src/ivfpq.cpp`
 
 Currently, Caliby's vector indexes (HNSW, DiskANN, IVF-PQ) are append-only. Implementing update and delete operations would significantly improve usability for production workloads.
@@ -45,8 +45,8 @@ Currently, Caliby's vector indexes (HNSW, DiskANN, IVF-PQ) are append-only. Impl
 
 ### 2. Vector Quantization Support
 
-**Status**: Partial (IVF-PQ exists)  
-**Complexity**: High  
+**Status**: Partial (IVF-PQ exists)
+**Complexity**: High
 **Files**: `include/caliby/ivfpq.hpp`, `src/ivfpq.cpp`, new files needed
 
 Improve memory efficiency and search speed through additional quantization methods.
@@ -87,8 +87,8 @@ class ScalarQuantizedIndex : public IndexBase {
 
 ### 3. Inner Product Distance Implementation
 
-**Status**: Placeholder exists  
-**Complexity**: Medium  
+**Status**: Placeholder exists
+**Complexity**: Medium
 **Files**: `include/caliby/ivfpq.hpp`, `include/caliby/distance.hpp`
 
 ```cpp
@@ -108,8 +108,8 @@ using InnerProductDistance = hnsw_distance::SIMDAcceleratedL2;  // TODO: impleme
 
 ### 4. B-Tree Inner Node Merging
 
-**Status**: Not Implemented  
-**Complexity**: Medium  
+**Status**: Not Implemented
+**Complexity**: Medium
 **Files**: `src/calico.cpp`
 
 ```cpp
@@ -129,8 +129,8 @@ Currently, B-tree inner nodes are not merged when underflow occurs. This can lea
 
 ### 5. Page ID Reuse After Deletion
 
-**Status**: Not Implemented  
-**Complexity**: Medium  
+**Status**: Not Implemented
+**Complexity**: Medium
 **Files**: `src/calico.cpp`, `src/collection.cpp`
 
 ```cpp
@@ -151,8 +151,8 @@ Currently, B-tree inner nodes are not merged when underflow occurs. This can lea
 
 ### 6. Collection Page Compaction
 
-**Status**: Not Implemented  
-**Complexity**: Medium  
+**Status**: Not Implemented
+**Complexity**: Medium
 **Files**: `src/collection.cpp`
 
 ```cpp
@@ -167,19 +167,23 @@ Currently, B-tree inner nodes are not merged when underflow occurs. This can lea
 - Reclaim overflow pages when documents are deleted
 - Consider background compaction thread
 
+=> Duy's suggestion:
+- Implement extent list with BlobState, better read performance than overflow pages
+- Fragmentation is a not-practical problem, and its complexity is one of the highest in computer science (both file systems & mem management have this issue for >= 50 years without being solved)
+
 ---
 
 ### 7. Query Optimizer with Statistics
 
-**Status**: Not Implemented  
-**Complexity**: Medium  
+**Status**: Not Implemented
+**Complexity**: Medium
 **Files**: `src/collection.cpp`
 
 ```cpp
 // TODO at src/collection.cpp:2313
 // TODO: Use B-tree indices for indexed fields
 
-// TODO at src/collection.cpp:2374  
+// TODO at src/collection.cpp:2374
 // TODO: Use statistics and histogram
 ```
 

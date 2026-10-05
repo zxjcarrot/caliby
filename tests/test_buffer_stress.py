@@ -225,7 +225,7 @@ class TestIndexFlush:
         vectors2 = np.random.randn(250, dim).astype(np.float32)
 
         index = caliby_module.HnswIndex(
-            max_elements=n, dim=dim, M=16, ef_construction=100, skip_recovery=True)
+            max_elements=n, dim=dim, M=16, ef_construction=100, skip_recovery=True, name="flush_cycles")
         index.add_points(vectors1)
         index.flush()
         caliby_module.flush_storage()
@@ -235,7 +235,7 @@ class TestIndexFlush:
         del index
 
         index2 = caliby_module.HnswIndex(
-            max_elements=n, dim=dim, M=16, ef_construction=100, skip_recovery=False)
+            max_elements=n, dim=dim, M=16, ef_construction=100, skip_recovery=False, name="flush_cycles")
         assert index2.was_recovered()
 
 
@@ -243,6 +243,10 @@ class TestCollectionBufferInteraction:
     """Test collection operations with buffer pool (session config)."""
 
     def test_collection_with_small_buffer(self, caliby_module, temp_dir):
+        try:
+            caliby_module.close()
+        except Exception:
+            pass
         caliby_module.open(temp_dir)
         schema = caliby.Schema()
         schema.add_field("category", caliby.FieldType.STRING)
@@ -264,6 +268,10 @@ class TestCollectionBufferInteraction:
         assert len(text_results) >= 1
 
     def test_collection_force_evict(self, caliby_module, temp_dir):
+        try:
+            caliby_module.close()
+        except Exception:
+            pass
         caliby_module.open(temp_dir)
         schema = caliby.Schema()
         schema.add_field("idx", caliby.FieldType.INT)
